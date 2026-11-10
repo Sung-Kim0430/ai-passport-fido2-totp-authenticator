@@ -20,6 +20,7 @@ run_static_checks() {
     fi
 
     python3 tools/check_repo.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_sdk_version_contract.py
 
     actionlint_bin="${ACTIONLINT_BIN:-}"
     if [[ -z "${actionlint_bin}" ]]; then
@@ -90,7 +91,7 @@ run_firmware_checks() (
     local validation_build_dir
 
     if ! command -v idf.py >/dev/null 2>&1; then
-        echo "ERROR: idf.py is not available; activate ESP-IDF 5.5.3 first." >&2
+        echo "ERROR: idf.py is not available; activate ESP-IDF 5.5.6 first." >&2
         return 1
     fi
 

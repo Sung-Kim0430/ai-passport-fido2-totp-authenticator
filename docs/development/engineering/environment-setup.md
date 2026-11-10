@@ -4,9 +4,15 @@
 
 # Environment Bootstrap for AI Agents
 
-This document lets an AI agent bootstrap a clean checkout without relying on a
-developer-specific shell function, absolute path, IDE, or preinstalled ESP-IDF.
-The required baseline is ESP-IDF 5.5.3 for ESP32-C3.
+> The current project baseline is ESP-IDF 5.5.6. Use the
+> [5.5.6 upgrade and installation record](esp-idf-5.5.6-upgrade.md) for the
+> current checkout. Host prerequisites and safety guidance below still apply;
+> the remaining 5.5.3 commands and mirror observations are historical upstream
+> references, not verified 5.5.6 mirror instructions.
+
+This document preserves the original ESP32-C3/ESP-IDF 5.5.3 bootstrap reference
+without relying on a developer-specific shell function or IDE. Do not use its
+old version commands to override the current baseline.
 
 ## Agent contract
 
