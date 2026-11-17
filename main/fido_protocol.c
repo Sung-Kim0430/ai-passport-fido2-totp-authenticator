@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 void fido_session_init(fido_session_t *session)
 {
@@ -83,78 +84,75 @@ void fido_session_reset(fido_session_t *session)
     memset(&session->current_req, 0, sizeof(session->current_req));
 }
 
-static void trim_whitespace(char *str)
+static bool parse_decimal(const char *text, uint64_t *value)
 {
-    if (!str) return;
-    size_t len = strlen(str);
-    while (len > 0 && (str[len - 1] == ' ' || str[len - 1] == '\r' || str[len - 1] == '\n' || str[len - 1] == '\t')) {
-        str[--len] = '\0';
+    if (!text || !*text) return false;
+    uint64_t parsed = 0;
+    for (; *text; ++text) {
+        if (*text < '0' || *text > '9') return false;
+        const unsigned digit = (unsigned)(*text - '0');
+        if (parsed > (UINT64_MAX - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
     }
+    *value = parsed;
+    return true;
 }
 
 fido_parsed_cmd_t fido_parse_command(const char *cmd_line)
 {
-    fido_parsed_cmd_t res;
-    memset(&res, 0, sizeof(res));
-    res.type = FIDO_CMD_NONE;
+    fido_parsed_cmd_t res = {0};
     res.otp_digits = 6;
     res.otp_period = 30;
-
-    if (!cmd_line || cmd_line[0] == '\0') {
-        return res;
-    }
+    if (!cmd_line || !*cmd_line) return res;
 
     char buf[256];
-    snprintf(buf, sizeof(buf), "%s", cmd_line);
-    trim_whitespace(buf);
+    res.type = FIDO_CMD_INVALID;
+    if (strlen(cmd_line) >= sizeof(buf)) return res;
+    memcpy(buf, cmd_line, strlen(cmd_line) + 1);
+    char *tokens[4];
+    size_t count = 0;
+    char *cursor = buf;
+    while (*cursor) {
+        while (isspace((unsigned char)*cursor)) ++cursor;
+        if (!*cursor) break;
+        if (count == sizeof(tokens) / sizeof(tokens[0])) return res;
+        tokens[count++] = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor)) ++cursor;
+        if (*cursor) *cursor++ = 0;
+    }
+    if (!count) { res.type = FIDO_CMD_NONE; return res; }
 
-    if (buf[0] == '\0') {
+    const char *cmd = tokens[0];
+    fido_cmd_type_t type = FIDO_CMD_INVALID;
+    if (!strcmp(cmd, "AUTH_REQ")) type = FIDO_CMD_AUTH_REQ;
+    else if (!strcmp(cmd, "REG_REQ")) type = FIDO_CMD_REG_REQ;
+    else if (!strcmp(cmd, "ADD_TOTP")) type = FIDO_CMD_ADD_TOTP;
+    if (type != FIDO_CMD_INVALID) {
+        if (count != 4 || strlen(tokens[1]) >= sizeof(res.param1) ||
+            strlen(tokens[2]) >= sizeof(res.param2) || strlen(tokens[3]) >= sizeof(res.param3)) return res;
+        strcpy(res.param1, tokens[1]);
+        strcpy(res.param2, tokens[2]);
+        strcpy(res.param3, tokens[3]);
+        res.type = type;
         return res;
     }
 
-    char cmd[32] = {0};
-    int consumed = 0;
-    if (sscanf(buf, "%31s%n", cmd, &consumed) <= 0) {
-        res.type = FIDO_CMD_INVALID;
+    if (!strcmp(cmd, "SYNC_TIME")) type = FIDO_CMD_SYNC_TIME;
+    else if (!strcmp(cmd, "DEL_TOTP")) type = FIDO_CMD_DEL_TOTP;
+    else if (!strcmp(cmd, "SET_BRIGHTNESS")) type = FIDO_CMD_SET_BRIGHTNESS;
+    else if (!strcmp(cmd, "SET_SOUND")) type = FIDO_CMD_SET_SOUND;
+    if (type != FIDO_CMD_INVALID) {
+        if (count != 2 || !parse_decimal(tokens[1], &res.num_param)) return res;
+        if (type == FIDO_CMD_SET_SOUND && res.num_param > 1) return res;
+        if (type == FIDO_CMD_SET_BRIGHTNESS && (res.num_param < 10 || res.num_param > 100)) return res;
+        res.type = type;
         return res;
     }
-
-    const char *args = buf + consumed;
-    while (*args == ' ' || *args == '\t') args++;
-
-    if (strcmp(cmd, "AUTH_REQ") == 0) {
-        res.type = FIDO_CMD_AUTH_REQ;
-        sscanf(args, "%63s %63s %63s", res.param1, res.param2, res.param3);
-    } else if (strcmp(cmd, "REG_REQ") == 0) {
-        res.type = FIDO_CMD_REG_REQ;
-        sscanf(args, "%63s %63s %63s", res.param1, res.param2, res.param3);
-    } else if (strcmp(cmd, "CANCEL") == 0) {
-        res.type = FIDO_CMD_CANCEL;
-    } else if (strcmp(cmd, "SYNC_TIME") == 0) {
-        res.type = FIDO_CMD_SYNC_TIME;
-        res.num_param = (uint64_t)strtoull(args, NULL, 10);
-    } else if (strcmp(cmd, "ADD_TOTP") == 0) {
-        res.type = FIDO_CMD_ADD_TOTP;
-        sscanf(args, "%63s %63s %63s", res.param1, res.param2, res.param3);
-    } else if (strcmp(cmd, "DEL_TOTP") == 0) {
-        res.type = FIDO_CMD_DEL_TOTP;
-        res.num_param = (uint64_t)strtoull(args, NULL, 10);
-    } else if (strcmp(cmd, "LIST_TOTP") == 0) {
-        res.type = FIDO_CMD_LIST_TOTP;
-    } else if (strcmp(cmd, "GET_STATUS") == 0) {
-        res.type = FIDO_CMD_GET_STATUS;
-    } else if (strcmp(cmd, "SET_BRIGHTNESS") == 0) {
-        res.type = FIDO_CMD_SET_BRIGHTNESS;
-        res.num_param = (uint64_t)strtoul(args, NULL, 10);
-    } else if (strcmp(cmd, "SET_SOUND") == 0) {
-        res.type = FIDO_CMD_SET_SOUND;
-        res.num_param = (uint64_t)strtoul(args, NULL, 10);
-    } else if (strcmp(cmd, "WIPE_ALL") == 0) {
-        res.type = FIDO_CMD_RESET;
-    } else {
-        res.type = FIDO_CMD_INVALID;
-    }
-
+    if (count != 1) return res;
+    if (!strcmp(cmd, "CANCEL")) res.type = FIDO_CMD_CANCEL;
+    else if (!strcmp(cmd, "LIST_TOTP")) res.type = FIDO_CMD_LIST_TOTP;
+    else if (!strcmp(cmd, "GET_STATUS")) res.type = FIDO_CMD_GET_STATUS;
+    else if (!strcmp(cmd, "WIPE_ALL")) res.type = FIDO_CMD_RESET;
     return res;
 }
 
@@ -237,13 +235,35 @@ static bool cbor_read_text_str(const uint8_t *buf, size_t max_len, size_t *offse
     if (!cbor_get_type_len(buf, max_len, offset, &major, &s_len) || major != 3) {
         return false;
     }
-    if (*offset + s_len > max_len) return false;
+    if (s_len > max_len - *offset ||
+        (out_str && (max_out == 0 || s_len >= max_out ||
+                     memchr(buf + *offset, 0, s_len)))) return false;
     if (out_str && max_out > 0) {
-        size_t cp = (s_len < max_out - 1) ? s_len : (max_out - 1);
+        size_t cp = s_len;
         memcpy(out_str, buf + *offset, cp);
         out_str[cp] = '\0';
     }
     *offset += s_len;
+    return true;
+}
+
+// Display labels may be shortened; RP identities must use the strict reader.
+static bool cbor_read_label(const uint8_t *buf, size_t len, size_t *off,
+                            char *out, size_t capacity)
+{
+    uint8_t major;
+    size_t size;
+    if (!cbor_get_type_len(buf, len, off, &major, &size) || major != 3 ||
+        size > len - *off || memchr(buf + *off, 0, size)) return false;
+    if (out && capacity) {
+        size_t copy = size < capacity - 1 ? size : capacity - 1;
+        if (copy < size) {
+            while (copy && (buf[*off + copy] & 0xc0) == 0x80) --copy;
+        }
+        memcpy(out, buf + *off, copy);
+        out[copy] = 0;
+    }
+    *off += size;
     return true;
 }
 
@@ -291,31 +311,22 @@ static bool cbor_read_bool(const uint8_t *buf, size_t max_len, size_t *offset, b
     return false;
 }
 
-static void cbor_parse_options(const uint8_t *payload, size_t len, size_t *off,
+static bool cbor_parse_options(const uint8_t *payload, size_t len, size_t *off,
                                fido_auth_params_t *out_auth)
 {
     uint8_t major = 0;
     size_t pairs = 0;
-    if (!cbor_get_type_len(payload, len, off, &major, &pairs) || major != 5) {
-        cbor_skip_item(payload, len, off);
-        return;
-    }
-
-    for (size_t i = 0; i < pairs && *off < len; i++) {
+    if (!cbor_get_type_len(payload, len, off, &major, &pairs) || major != 5) return false;
+    for (size_t i = 0; i < pairs; i++) {
         char name[16] = {0};
-        if (cbor_read_text_str(payload, len, off, name, sizeof(name))) {
-            if (strcmp(name, "uv") == 0) {
-                cbor_read_bool(payload, len, off, &out_auth->uv_requested);
-            } else if (strcmp(name, "rk") == 0) {
-                cbor_read_bool(payload, len, off, &out_auth->rk_requested);
-            } else {
-                cbor_skip_item(payload, len, off);
-            }
-        } else {
-            cbor_skip_item(payload, len, off);
-            cbor_skip_item(payload, len, off);
-        }
+        if (!cbor_read_text_str(payload, len, off, name, sizeof(name))) return false;
+        if (!strcmp(name, "uv")) {
+            if (!cbor_read_bool(payload, len, off, &out_auth->uv_requested)) return false;
+        } else if (!strcmp(name, "rk")) {
+            if (!cbor_read_bool(payload, len, off, &out_auth->rk_requested)) return false;
+        } else if (!cbor_skip_item(payload, len, off)) return false;
     }
+    return true;
 }
 
 bool ctap2_parse_make_credential(const uint8_t *payload, size_t len,
@@ -335,6 +346,8 @@ bool ctap2_parse_make_credential(const uint8_t *payload, size_t len,
 
     size_t off = 0;
     if (payload[0] == 0x01) off = 1; /* Skip command code */
+    size_t end = off;
+    if (!cbor_skip_item(payload, len, &end) || end != len) return false;
 
     uint8_t top_major = 0;
     size_t num_pairs = 0;
@@ -346,9 +359,7 @@ bool ctap2_parse_make_credential(const uint8_t *payload, size_t len,
         uint8_t k_major = 0;
         size_t key_num = 0;
         if (!cbor_get_type_len(payload, len, &off, &k_major, &key_num) || k_major != 0) {
-            if (!cbor_skip_item(payload, len, &off)) return false; /* skip key */
-            if (!cbor_skip_item(payload, len, &off)) return false; /* skip val */
-            continue;
+            return false;
         }
 
         if (key_num == 1) {
@@ -368,17 +379,16 @@ bool ctap2_parse_make_credential(const uint8_t *payload, size_t len,
                     char field_name[32] = {0};
                     if (cbor_read_text_str(payload, len, &off, field_name, sizeof(field_name))) {
                         if (strcmp(field_name, "id") == 0) {
-                            cbor_read_text_str(payload, len, &off, out_rpid, rpid_max);
+                            if (!cbor_read_text_str(payload, len, &off, out_rpid, rpid_max)) return false;
                         } else {
                             if (!cbor_skip_item(payload, len, &off)) return false;
                         }
                     } else {
-                        if (!cbor_skip_item(payload, len, &off)) return false;
-                        if (!cbor_skip_item(payload, len, &off)) return false;
+                        return false;
                     }
                 }
             } else {
-                if (!cbor_skip_item(payload, len, &off)) return false;
+                return false;
             }
         } else if (key_num == 3) {
             /* Key 3: user Map */
@@ -390,15 +400,14 @@ bool ctap2_parse_make_credential(const uint8_t *payload, size_t len,
                     if (cbor_read_text_str(payload, len, &off, field_name, sizeof(field_name))) {
                         if (strcmp(field_name, "name") == 0 ||
                             (strcmp(field_name, "displayName") == 0 && out_username && out_username[0] == '\0')) {
-                            cbor_read_text_str(payload, len, &off, out_username, user_max);
+                            if (!cbor_read_label(payload, len, &off, out_username, user_max)) return false;
                         } else if (strcmp(field_name, "id") == 0) {
-                            cbor_read_byte_str(payload, len, &off, out_userid, 64, out_userid_len);
+                            if (!cbor_read_byte_str(payload, len, &off, out_userid, 64, out_userid_len)) return false;
                         } else {
                             if (!cbor_skip_item(payload, len, &off)) return false;
                         }
                     } else {
-                        if (!cbor_skip_item(payload, len, &off)) return false;
-                        if (!cbor_skip_item(payload, len, &off)) return false;
+                        return false;
                     }
                 }
             } else {
@@ -407,17 +416,17 @@ bool ctap2_parse_make_credential(const uint8_t *payload, size_t len,
         } else if (key_num == 7) {
             /* Key 7: options map { "uv": bool, "rk": bool } */
             if (out_auth) {
-                cbor_parse_options(payload, len, &off, out_auth);
+                if (!cbor_parse_options(payload, len, &off, out_auth)) return false;
             } else {
                 if (!cbor_skip_item(payload, len, &off)) return false;
             }
         } else if (key_num == 8) {
             /* Key 8: pinUvAuthParam */
             if (out_auth) {
-                cbor_read_byte_str(payload, len, &off,
+                if (!cbor_read_byte_str(payload, len, &off,
                                    out_auth->pin_uv_auth_param,
                                    sizeof(out_auth->pin_uv_auth_param),
-                                   &out_auth->pin_uv_auth_param_len);
+                                   &out_auth->pin_uv_auth_param_len)) return false;
             } else {
                 if (!cbor_skip_item(payload, len, &off)) return false;
             }
@@ -425,9 +434,9 @@ bool ctap2_parse_make_credential(const uint8_t *payload, size_t len,
             /* Key 9: pinUvAuthProtocol */
             if (out_auth) {
                 uint64_t proto = 0;
-                if (cbor_read_uint(payload, len, &off, &proto)) {
+                if (cbor_read_uint(payload, len, &off, &proto) && proto <= UINT8_MAX) {
                     out_auth->pin_uv_auth_protocol = (uint8_t)proto;
-                }
+                } else return false;
             } else {
                 if (!cbor_skip_item(payload, len, &off)) return false;
             }
@@ -457,6 +466,8 @@ bool ctap2_parse_get_assertion(const uint8_t *payload, size_t len,
 
     size_t off = 0;
     if (payload[0] == 0x02) off = 1; /* Skip command code */
+    size_t end = off;
+    if (!cbor_skip_item(payload, len, &end) || end != len) return false;
 
     uint8_t top_major = 0;
     size_t num_pairs = 0;
@@ -468,14 +479,12 @@ bool ctap2_parse_get_assertion(const uint8_t *payload, size_t len,
         uint8_t k_major = 0;
         size_t key_num = 0;
         if (!cbor_get_type_len(payload, len, &off, &k_major, &key_num) || k_major != 0) {
-            if (!cbor_skip_item(payload, len, &off)) return false;
-            if (!cbor_skip_item(payload, len, &off)) return false;
-            continue;
+            return false;
         }
 
         if (key_num == 1) {
             /* Key 1: rpId directly as text string */
-            cbor_read_text_str(payload, len, &off, out_rpid, rpid_max);
+            if (!cbor_read_text_str(payload, len, &off, out_rpid, rpid_max)) return false;
         } else if (key_num == 2) {
             /* Key 2: clientDataHash as byte string */
             size_t cdh_len = 0;
@@ -486,6 +495,7 @@ bool ctap2_parse_get_assertion(const uint8_t *payload, size_t len,
             cdh_seen = true;
         } else if (key_num == 3) {
             /* Key 3: allowList Array */
+            const size_t list_start = off;
             uint8_t arr_major = 0;
             size_t arr_len = 0;
             if (cbor_get_type_len(payload, len, &off, &arr_major, &arr_len) && arr_major == 4) {
@@ -497,36 +507,46 @@ bool ctap2_parse_get_assertion(const uint8_t *payload, size_t len,
                             char field[32] = {0};
                             if (cbor_read_text_str(payload, len, &off, field, sizeof(field))) {
                                 if (strcmp(field, "id") == 0 && out_allow_id && out_allow_id_len) {
-                                    cbor_read_byte_str(payload, len, &off, out_allow_id, 64, out_allow_id_len);
+                                    const size_t id_start = off;
+                                    size_t ignored = 0;
+                                    if (!cbor_read_byte_str(payload, len, &off, NULL, SIZE_MAX, &ignored)) return false;
+                                    size_t header = id_start, id_len = 0;
+                                    uint8_t id_major = 0;
+                                    if (!cbor_get_type_len(payload, len, &header, &id_major, &id_len)) return false;
+                                    *out_allow_id_len = id_len <= 64 ? id_len : 0;
+                                    if (*out_allow_id_len) memcpy(out_allow_id, payload + header, id_len);
                                 } else {
                                     if (!cbor_skip_item(payload, len, &off)) return false;
                                 }
                             } else {
-                                if (!cbor_skip_item(payload, len, &off)) return false;
-                                if (!cbor_skip_item(payload, len, &off)) return false;
+                                return false;
                             }
                         }
                     } else {
-                        if (!cbor_skip_item(payload, len, &off)) return false;
+                        return false;
                     }
                 }
             } else {
-                if (!cbor_skip_item(payload, len, &off)) return false;
+                return false;
+            }
+            if (out_auth) {
+                out_auth->allow_list = payload + list_start;
+                out_auth->allow_list_len = off - list_start;
             }
         } else if (key_num == 5) {
             /* Key 5: options map { "uv": bool } */
             if (out_auth) {
-                cbor_parse_options(payload, len, &off, out_auth);
+                if (!cbor_parse_options(payload, len, &off, out_auth)) return false;
             } else {
                 if (!cbor_skip_item(payload, len, &off)) return false;
             }
         } else if (key_num == 6) {
             /* Key 6: pinUvAuthParam */
             if (out_auth) {
-                cbor_read_byte_str(payload, len, &off,
+                if (!cbor_read_byte_str(payload, len, &off,
                                    out_auth->pin_uv_auth_param,
                                    sizeof(out_auth->pin_uv_auth_param),
-                                   &out_auth->pin_uv_auth_param_len);
+                                   &out_auth->pin_uv_auth_param_len)) return false;
             } else {
                 if (!cbor_skip_item(payload, len, &off)) return false;
             }
@@ -534,9 +554,9 @@ bool ctap2_parse_get_assertion(const uint8_t *payload, size_t len,
             /* Key 7: pinUvAuthProtocol */
             if (out_auth) {
                 uint64_t proto = 0;
-                if (cbor_read_uint(payload, len, &off, &proto)) {
+                if (cbor_read_uint(payload, len, &off, &proto) && proto <= UINT8_MAX) {
                     out_auth->pin_uv_auth_protocol = (uint8_t)proto;
-                }
+                } else return false;
             } else {
                 if (!cbor_skip_item(payload, len, &off)) return false;
             }
@@ -550,6 +570,38 @@ bool ctap2_parse_get_assertion(const uint8_t *payload, size_t len,
     return true;
 }
 
+bool ctap2_allow_list_contains(const uint8_t *list, size_t len,
+                               const uint8_t *credential, size_t credential_len)
+{
+    if (!list || !credential || !credential_len) return false;
+    size_t end = 0;
+    if (!cbor_skip_item(list, len, &end) || end != len) return false;
+    size_t off = 0, count = 0;
+    uint8_t major;
+    if (!cbor_get_type_len(list, len, &off, &major, &count) || major != 4) return false;
+    bool matched = false;
+    for (size_t i = 0; i < count; ++i) {
+        size_t pairs = 0;
+        if (!cbor_get_type_len(list, len, &off, &major, &pairs) || major != 5) return false;
+        bool id_seen = false;
+        for (size_t j = 0; j < pairs; ++j) {
+            char field[32];
+            if (!cbor_read_text_str(list, len, &off, field, sizeof(field))) return false;
+            if (!strcmp(field, "id")) {
+                if (id_seen) return false;
+                id_seen = true;
+                size_t id_len = 0;
+                if (!cbor_get_type_len(list, len, &off, &major, &id_len) ||
+                    major != 2 || id_len > len - off) return false;
+                if (id_len == credential_len && !memcmp(list + off, credential, id_len)) matched = true;
+                off += id_len;
+            } else if (!cbor_skip_item(list, len, &off)) return false;
+        }
+        if (!id_seen) return false;
+    }
+    return matched;
+}
+
 size_t ctap2_build_make_credential_resp(const uint8_t rpid_hash[32],
                                         const uint8_t aaguid[16],
                                         const uint8_t *cred_id,
@@ -561,7 +613,7 @@ size_t ctap2_build_make_credential_resp(const uint8_t rpid_hash[32],
                                         uint8_t *out_buf,
                                         size_t max_buf)
 {
-    if (!rpid_hash || !aaguid || !cred_id || cred_id_len == 0 || cred_id_len > 255 ||
+    if (!rpid_hash || !aaguid || !cred_id || cred_id_len == 0 || cred_id_len > 123 ||
         !qx || !qy || !out_buf || max_buf < 300) {
         return 0;
     }
@@ -638,10 +690,15 @@ size_t ctap2_build_get_assertion_resp(const uint8_t rpid_hash[32],
                                       uint8_t *out_buf,
                                       size_t max_buf)
 {
-    if (!rpid_hash || !cred_id || cred_id_len == 0 ||
-        !sig_der || sig_len == 0 || !out_buf || max_buf < 256) {
+    if (!rpid_hash || !cred_id || cred_id_len == 0 || cred_id_len > 255 ||
+        !sig_der || sig_len == 0 || sig_len > 255 || !out_buf ||
+        user_id_len > 64 || (user_id_len && !user_id)) {
         return 0;
     }
+
+    const size_t required = 66 + (cred_id_len < 24 ? 1 : 2) + cred_id_len + sig_len +
+                            (user_id_len ? 7 + user_id_len : 0);
+    if (required > max_buf) return 0;
 
     /* 1. Assemble authData (37 bytes): rpIdHash (32) + flags (1) + signCount (4).
      * The caller must sign exactly this buffer; the flags and counter here must

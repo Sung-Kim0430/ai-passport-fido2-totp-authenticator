@@ -529,6 +529,8 @@ void auth_ui_init(void)
 
     for (int i = 0; i < AUTH_MAX_FIDO_RPS; i++) {
         s_lbl_fido_acc_items[i] = lv_label_create(s_pnl_fido_acc);
+        lv_obj_set_width(s_lbl_fido_acc_items[i], 206);
+        lv_label_set_long_mode(s_lbl_fido_acc_items[i], LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(s_lbl_fido_acc_items[i], &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(s_lbl_fido_acc_items[i], color_text_pri, 0);
         lv_obj_align(s_lbl_fido_acc_items[i], LV_ALIGN_TOP_LEFT, 6, 36 + i * 30);
@@ -1145,12 +1147,14 @@ void auth_ui_update_lab(uint8_t selected_idx, bool ble_fido_enabled,
     lv_obj_set_style_text_color(s_lbl_lab_items[4], selected_idx == 4 ? color_cyan : color_text_pri, 0);
 }
 
-void auth_ui_update_fido_accounts(const char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_t count,
+void auth_ui_update_fido_accounts(const auth_fido_site_t *rps, uint8_t count,
                                   uint8_t selected_idx, bool confirm_delete)
 {
     if (s_current_view != AUTH_VIEW_FIDO_ACCOUNTS) return;
 
-    char buf[64];
+    char buf[AUTH_FIDO_RP_MAX + 24];
+    bool legacy = count && selected_idx < count && rps[selected_idx].legacy;
+    confirm_delete = confirm_delete && !legacy;
     if (count == 0) {
         set_label_text_if_changed(s_lbl_fido_acc_items[0], "No FIDO credentials");
         lv_obj_set_style_text_color(s_lbl_fido_acc_items[0], color_text_mut, 0);
@@ -1161,10 +1165,11 @@ void auth_ui_update_fido_accounts(const char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_
         for (int i = 0; i < AUTH_MAX_FIDO_RPS; i++) {
             if (i < count) {
                 bool sel = (i == selected_idx);
-                if (sel && confirm_delete) {
-                    snprintf(buf, sizeof(buf), "> %.12s [OK AGAIN]", rps[i]);
-                } else {
-                    snprintf(buf, sizeof(buf), "%s %.12s", sel ? ">" : " ", rps[i]);
+                snprintf(buf, sizeof(buf), "%s %s%s", sel ? ">" : " ",
+                         rps[i].legacy ? "Legacy: " : "", rps[i].rp_id);
+                lv_label_long_mode_t mode = sel ? LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_DOT;
+                if (lv_label_get_long_mode(s_lbl_fido_acc_items[i]) != mode) {
+                    lv_label_set_long_mode(s_lbl_fido_acc_items[i], mode);
                 }
                 set_label_text_if_changed(s_lbl_fido_acc_items[i], buf);
                 lv_obj_set_style_text_color(s_lbl_fido_acc_items[i],
@@ -1176,6 +1181,7 @@ void auth_ui_update_fido_accounts(const char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_
     }
 
     set_label_text_if_changed(s_lbl_fido_acc_msg,
+                      legacy ? "Use site to migrate [HOLD] Back" :
                       confirm_delete ? "Press OK again to delete" : "[OK] Delete  [HOLD] Back");
     lv_obj_set_style_text_color(s_lbl_fido_acc_msg, confirm_delete ? color_red : color_text_mut, 0);
 
@@ -1245,7 +1251,7 @@ void auth_ui_update_set_time(uint8_t a, int y, int mo, int d, int h, int mi, int
 void auth_ui_update_lab(uint8_t s, bool b, bool c, bool cr) {
     (void)s; (void)b; (void)c; (void)cr;
 }
-void auth_ui_update_fido_accounts(const char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_t c,
+void auth_ui_update_fido_accounts(const auth_fido_site_t *rps, uint8_t c,
                                   uint8_t s, bool d) {
     (void)rps; (void)c; (void)s; (void)d;
 }

@@ -23,6 +23,7 @@ class RtcHttpStatusTests(unittest.TestCase):
 #include <stdio.h>
 #include <string.h>
 #include "auth_wifi.h"
+#include "auth_time_sync.h"
 #include "totp_crypto.h"
 typedef int esp_err_t;
 typedef struct { size_t content_len; const char *body; } httpd_req_t;
@@ -60,12 +61,18 @@ static size_t httpd_req_get_hdr_value_len(httpd_req_t *r, const char *name) { (v
 static int httpd_req_recv(httpd_req_t *r, char *out, size_t n) { memcpy(out,r->body,n); return (int)n; }
 static int httpd_resp_set_status(httpd_req_t *r, const char *s) { (void)r; status_code=atoi(s); return 0; }
 static int httpd_resp_set_type(httpd_req_t *r, const char *s) { (void)r; (void)s; return 0; }
-static int httpd_resp_send(httpd_req_t *r, const char *s, int n) { (void)r; (void)s; (void)n; return 0; }
+static char response[256];
+static int httpd_resp_set_hdr(httpd_req_t *r, const char *k, const char *v) { (void)r; (void)k; (void)v; return 0; }
+static int httpd_resp_send_500(httpd_req_t *r) { (void)r; status_code=500; return 0; }
+static int httpd_resp_send(httpd_req_t *r, const char *s, int n) {
+    (void)r; if(n<0)n=(int)strlen(s);assert((size_t)n<sizeof response);
+    memcpy(response,s,(size_t)n);response[n]=0;return 0;
+}
 typedef struct cJSON { const char *name; char *valuestring; double valuedouble; int type; } cJSON;
-static cJSON fields[8];
+static cJSON fields[10];
 static cJSON root = {.type=1};
 static const cJSON *cJSON_GetObjectItemCaseSensitive(const cJSON *j, const char *key) {
-    (void)j; for (unsigned i=0;i<8;i++) if (fields[i].name && !strcmp(fields[i].name,key)) return &fields[i]; return NULL;
+    (void)j; for (unsigned i=0;i<10;i++) if (fields[i].name && !strcmp(fields[i].name,key)) return &fields[i]; return NULL;
 }
 static bool cJSON_IsObject(const cJSON *j) { return j && j->type==1; }
 static bool cJSON_IsNumber(const cJSON *j) { return j && j->type==2; }
@@ -89,9 +96,11 @@ static void fixture(uint32_t id) {
         context = context.replace('#include <stdio.h>', '#include <stdio.h>\n#include <stdlib.h>')
         functions = "\n".join("static " + signature + " {\n" + function_body(source, name) + "\n}" for name, signature in [
             ("error_response", "esp_err_t error_response(httpd_req_t *req, const char *status, const char *message)"),
+            ("time_probe_handler", "esp_err_t time_probe_handler(httpd_req_t *req)"),
             ("string_field", "bool string_field(const cJSON *json, const char *name, char *out, size_t capacity)"),
             ("number_field", "bool number_field(const cJSON *json, const char *name, uint64_t max, uint64_t *out)"),
             ("parse_time_reference", "void parse_time_reference(const cJSON *json, fido_parsed_cmd_t *cmd)"),
+            ("parse_precise_time_reference", "bool parse_precise_time_reference(const cJSON *json, fido_parsed_cmd_t *cmd)"),
             ("parse_command_json", "bool parse_command_json(const cJSON *json, fido_parsed_cmd_t *cmd)"),
             ("command_handler", "esp_err_t command_handler(httpd_req_t *req)")])
         functions += "\nbool auth_wifi_ap_stop(void) {\n" + function_body(source, "auth_wifi_ap_stop") + "\n}\n"
@@ -156,6 +165,47 @@ int main(void) {
     s_time_probe_counter=UINT32_MAX-1;
     p=time_probe_record(INT64_MAX-1000,1000,true); assert(p.id==UINT32_MAX);
     next=time_probe_record(now,20,true); assert(next.id==1); fixture(p.id); legacy();
+    s_cmd_cb=callback; strcpy(s_session,"00000000000000000000000000000000");
+    auth_time_sync_reset(&s_precise_time_probes, 99);
+    now=100000;
+    auth_time_sync_probe_t precise=auth_time_sync_record(&s_precise_time_probes,90000,95000);
+    fixture(precise.id);
+    fields[6]=(cJSON){"reference_version",NULL,2,2};
+    fields[7]=(cJSON){"reference_spread_us",NULL,200,2};
+    dispatch();
+    assert(status_code==202 && queued.time_reference_precise && queued.time_reference_quality);
+    assert(queued.time_reference_hrt_us==92500);
+    assert(queued.time_reference_transport_uncertainty_us==18701);
+    assert(queued.time_reference_phone_uncertainty_us==1000000);
+    assert(queued.time_reference_uncertainty_us==1018701);
+    dispatch(); assert(status_code==400); /* No legacy fallback on replay. */
+    precise=auth_time_sync_record(&s_precise_time_probes,90000,95000);
+    fixture(precise.id); fields[6]=(cJSON){"reference_version",NULL,2,2};
+    fields[7]=(cJSON){"reference_spread_us",NULL,0,2};
+    queue_ok=false; dispatch(); assert(status_code==503); queue_ok=true;
+    dispatch(); assert(status_code==400); /* Ambiguous submission cannot be replayed. */
+    for(unsigned i=0;i<5;i++) {
+        precise=auth_time_sync_record(&s_precise_time_probes,now,now+20);
+        fixture(precise.id); fields[6]=(cJSON){"reference_version",NULL,2,2};
+        fields[7]=(cJSON){"reference_spread_us",NULL,200,2};
+        if(i==0)fields[6].valuedouble=3;
+        if(i==1)fields[7].valuedouble=20001;
+        if(i==2)fields[7].valuedouble=0.5;
+        if(i==3)fields[4].valuedouble=19;
+        if(i==4)now+=5000011;
+        dispatch(); assert(status_code==400);
+    }
+    httpd_req_t req={0,NULL};
+    now=100000;status_code=200;
+    unsigned previous=s_precise_time_probes.counter;
+    assert(time_probe_handler(&req)==0 && status_code==200);
+    assert(s_precise_time_probes.counter==previous+1);
+    assert(strstr(response,"\"version\":2") && strstr(response,"\"received_us\":100000"));
+    assert(strstr(response,"\"sent_us\":100000") && strstr(response,"\"valid\":true"));
+    assert(!strstr(response,"session") && !strstr(response,"device_id"));
+    token="bad";assert(time_probe_handler(&req)==0 && status_code==403);token=s_session;
+    s_snapshot.unlocked=false;assert(time_probe_handler(&req)==0 && status_code==423);
+    assert(s_precise_time_probes.counter==previous+1);s_snapshot.unlocked=true;
     puts("Actual reference parser, four-slot cache and guarded dispatch: PASS");
     return 0;
 }
@@ -167,7 +217,7 @@ int main(void) {
         self.assertIn("memset(s_time_probes, 0, sizeof(s_time_probes))", stop)
 
     def compile_run(self, source):
-        with tempfile.TemporaryDirectory(dir=os.environ["COMMANDCODE_SCRATCHPAD"]) as directory:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("COMMANDCODE_SCRATCHPAD")) as directory:
             path = Path(directory)
             c, binary = path / "reference.c", path / "reference"
             c.write_text(source, encoding="utf-8")
@@ -190,6 +240,7 @@ int main(void) {
 #include <string.h>
 #include <sys/time.h>
 #include "rtc_clock.h"
+#include "auth_time_sync.h"
 #define gettimeofday status_gettimeofday
 typedef int esp_err_t;
 typedef int httpd_req_t;

@@ -132,7 +132,7 @@ void auth_ui_update_lab(uint8_t selected_idx, bool ble_fido_enabled,
 /**
  * @brief Update FIDO credential list.
  */
-void auth_ui_update_fido_accounts(const char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_t count,
+void auth_ui_update_fido_accounts(const auth_fido_site_t *rps, uint8_t count,
                                   uint8_t selected_idx, bool confirm_delete);
 
 /**

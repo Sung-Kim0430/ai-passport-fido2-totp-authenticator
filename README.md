@@ -157,16 +157,35 @@ setter is consumed, cannot run twice, and requires resynchronization. PIN timing
 and credential schemas are unchanged.
 
 Use the Wi-Fi page's **explicit time-sync button with an accurately configured
-phone** to provide learning references. Status polling never synchronizes or
-trains. A four-entry one-use HRT-probe cache, browser UTC/monotonic bracket,
-2-second RTT bound, 1-ms device window and 5-second total-age bound qualify the
-reference. The declared phone/quantization bound is one second, not a firmware
-measurement of phone accuracy. Manual time entry and legacy/invalid-quality
-commands still set time but do not train. Learning subtracts measured awake HRT
-from independent reference elapsed time and compares it with **uncorrected**
-bridge history, not the already-compensated wall error. It requires two consistent,
-nonoverlapping eligible observations, each with at least six hours of raw bridge
-exposure, no more than 30 days and at most 100 ppm reference/accounting uncertainty.
+phone** to provide learning references. One click collects up to 12 sequential
+millisecond-resolution exchanges within a three-second sampling budget; each
+probe has a 500 ms deadline covering its response body. At least six valid
+samples are required. The fastest third (three to five samples) supplies a
+median UTC-to-device offset; a selected-group maximum absolute deviation from its median above 20 ms is rejected.
+The four timestamps remove measured device-handler time from the round trip.
+Remaining browser, transport and scheduling overhead, including asymmetric
+paths, stays in the uncertainty estimate. Timestamp resolution is not measured
+absolute UTC accuracy.
+
+The authenticated `/api/time-probe` endpoint has an independent 16-entry one-use
+cache, isolated from status polling. Sampling pauses page polling and mutations.
+Clock steps, session/device changes, lock, and inadequate samples abort without
+setting time. The final version-2 command is submitted once and never retried
+automatically; invalid or expired references do not fall back to seconds. Both
+HTTP admission and the application owner enforce the five-second reference age.
+Legacy clients retain their original single-probe/integer-second behavior.
+
+Transport uncertainty is `ceil((RTT - handler_time) / 2) + 1000 us + spread`.
+The phone's separate assumed UTC bound remains **one second**, not a firmware
+measurement of phone accuracy. Both terms enter the learning uncertainty; a
+fast Wi-Fi exchange does not prove accurate phone UTC. The web result displays
+transport uncertainty and the phone limitation separately. Status polling never
+synchronizes or trains, and one multi-probe batch creates only one reference.
+Manual entry and legacy/invalid-quality commands do not train. Learning
+subtracts measured awake HRT from independent reference elapsed time and
+compares it with **uncorrected** bridge history, not already-compensated wall
+error. Windows require at least six hours of raw bridge exposure, at most
+30 days and at most 100 ppm reference/accounting uncertainty.
 Insufficient evidence leaves correction unchanged; the software rejection range
 is ±20000 ppm, not a hardware tolerance or promised accuracy.
 
@@ -327,6 +346,28 @@ The current FIDO credential model is experimental, not certified, and is not
 established as a production multi-account passkey implementation. Phone
 registration/login compatibility still needs end-to-end acceptance. Unit tests
 or a valid CBOR response do not establish browser compatibility.
+
+Site records now store the complete supported RP ID (up to 63 bytes), salt and
+user handle together. NVS keys use a SHA-256 fingerprint of the **entire** RP ID;
+every access also verifies the stored full ID and refuses a fingerprint collision.
+Sites sharing their first 12 characters have independent handles and deletion.
+
+Older prefix records migrate lazily when that site is used again, preserving the
+original salt and derived credential. Shared legacy material is retained for
+other, unmigrated sites. The Lab prioritizes full-ID records in its eight-row
+list, scrolls the selected full name, and marks old prefix rows `Legacy:`;
+those ambiguous rows are read-only until the site is used to migrate it. A
+per-RP tombstone blocks legacy fallback after deletion. Re-registering a deleted
+site creates a fresh salt, leaving the old credential invalid. Reset FIDO still
+clears the whole FIDO namespace. User handles already overwritten by an old
+prefix collision cannot be recovered automatically. Downgrading to firmware
+that only understands prefix records can revive those older credentials and
+ignores the new records/deletion markers; this migration does not support such
+a rollback. Preserve NVS when upgrading to test migration.
+
+Over-capacity RP IDs are rejected explicitly, while display-only labels may be
+shortened at UTF-8 boundaries. BLE storage errors refuse registration/login
+instead of returning success using temporary key material.
 
 The ESP32-C3 has fixed-function USB Serial/JTAG, **not a programmable USB HID
 FIDO2 endpoint**. USB Log Console only controls application logs; it does not

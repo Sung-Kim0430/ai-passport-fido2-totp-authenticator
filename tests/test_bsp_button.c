@@ -21,6 +21,33 @@ static int create_calls, callback_calls, fail_create, fail_callback;
 static int fail_adc, fail_channel, fail_cal, fail_read, fail_convert, fail_delete;
 static int raw_mv, reads, events, updated_events;
 static int64_t clock_us;
+static bool button_timer_running, core_callback_inflight;
+static int fail_timer_stop, fail_barrier_create, fail_barrier_stop, hold_barrier;
+struct test_timer { esp_timer_create_args_t args; bool active; };
+static struct test_timer barrier;
+esp_err_t iot_button_stop(void) {
+    if (fail_timer_stop) return ESP_FAIL;
+    if (!button_timer_running) return ESP_ERR_INVALID_STATE;
+    button_timer_running = false;
+    return ESP_OK;
+}
+esp_err_t esp_timer_create(const esp_timer_create_args_t *args, esp_timer_handle_t *h) {
+    assert(args->dispatch_method == ESP_TIMER_TASK);
+    if (fail_barrier_create) return ESP_ERR_NO_MEM;
+    barrier = (struct test_timer){.args = *args}; *h = &barrier; return ESP_OK;
+}
+esp_err_t esp_timer_start_once(esp_timer_handle_t h, uint64_t timeout) {
+    assert(h == &barrier && !button_timer_running && timeout > 0);
+    h->active = true; return ESP_OK;
+}
+esp_err_t esp_timer_stop_blocking(esp_timer_handle_t h, uint32_t timeout) {
+    (void)timeout; assert(h == &barrier);
+    if (fail_barrier_stop) return ESP_ERR_TIMEOUT;
+    h->active = false; return ESP_OK;
+}
+esp_err_t esp_timer_delete(esp_timer_handle_t h) {
+    assert(h == &barrier && !h->active); return ESP_OK;
+}
 
 esp_err_t adc_oneshot_new_unit(const adc_oneshot_unit_init_cfg_t *cfg, adc_oneshot_unit_handle_t *h) {
     assert(cfg->unit_id == BSP_BTN_ADC_UNIT && !adc_live);
@@ -76,7 +103,14 @@ int gpio_get_level(gpio_num_t pin) {
     (void)pin; ++gpio_level_calls; return gpio_level;
 }
 void vTaskDelay(TickType_t ticks) {
-    (void)ticks; ++delay_calls;
+    ++delay_calls;
+    clock_us += (int64_t)ticks * 1000;
+    if (barrier.active && !hold_barrier) {
+        /* Serial timer task finishes the old button core callback first. */
+        core_callback_inflight = false;
+        barrier.active = false;
+        barrier.args.callback(barrier.args.arg);
+    }
 }
 esp_err_t iot_button_create(const button_config_t *cfg, const button_driver_t *driver, button_handle_t *h) {
     // 判定门限必须由 BSP 显式下发；ADC 没有唤醒中断，不能停止轮询。
@@ -87,7 +121,7 @@ esp_err_t iot_button_create(const button_config_t *cfg, const button_driver_t *d
     for (int i = 0; i < BSP_BTN_COUNT; ++i) {
         if (buttons[i].live) continue;
         buttons[i] = (struct button_dev_t){ .driver = (button_driver_t *)driver, .live = true };
-        *h = &buttons[i]; ++live_buttons;
+        *h = &buttons[i]; ++live_buttons; button_timer_running = true;
         assert(driver->get_key_level((button_driver_t *)driver) == BUTTON_INACTIVE);
         return ESP_OK;
     }
@@ -95,6 +129,7 @@ esp_err_t iot_button_create(const button_config_t *cfg, const button_driver_t *d
 }
 esp_err_t iot_button_delete(button_handle_t h) {
     assert(h && h->live && adc_live && cal_live);
+    assert(!button_timer_running && !core_callback_inflight);
     if (fail_delete) return ESP_FAIL;
     assert(h->driver->del(h->driver) == ESP_OK);
     h->live = false; --live_buttons; return ESP_OK;
@@ -148,7 +183,7 @@ static void check_deep_sleep_prepare(void) {
     assert(bsp_button_prepare_deep_sleep(&level) == ESP_OK);
     assert(level == 1);
     assert(gpio_direction_calls == 1 && gpio_pull_calls == 1 && gpio_level_calls == 1);
-    assert(delay_calls == 1);
+    assert(delay_calls >= 1);
     assert(gpio_last_pin == BSP_BTN_GPIO);
     assert(gpio_last_mode == GPIO_MODE_INPUT);
     assert(gpio_last_pull == GPIO_PULLUP_ONLY);
@@ -474,7 +509,40 @@ static void check_key_lock_with_wake_guard(void) {
     fire(BSP_BTN_OK, BUTTON_PRESS_DOWN);
     assert(delivered == 1);
 }
+static void check_cleanup_quiescence(void) {
+    reset_faults();
+    assert(bsp_button_init(event_cb, &events) == ESP_OK);
+    core_callback_inflight = true;
+    fail_timer_stop = 1;
+    assert(button_cleanup() != ESP_OK);
+    assert(live_buttons == BSP_BTN_COUNT && adc_live && cal_live);
+    fail_timer_stop = 0; fail_barrier_create = 1;
+    assert(button_cleanup() != ESP_OK);
+    assert(live_buttons == BSP_BTN_COUNT && adc_live && cal_live);
+    fail_barrier_create = 0; hold_barrier = 1;
+    assert(button_cleanup() == ESP_ERR_TIMEOUT);
+    assert(live_buttons == BSP_BTN_COUNT && adc_live && cal_live && core_callback_inflight);
+    fail_barrier_stop = 1;
+    assert(button_cleanup() == ESP_ERR_TIMEOUT);
+    assert(live_buttons == BSP_BTN_COUNT && adc_live && cal_live && barrier.active);
+    fail_barrier_stop = 0;
+    /* Retry while the old sentinel is still pending must drain it first. */
+    hold_barrier = 0;
+    assert(button_cleanup() == ESP_OK);
+    assert_clean();
+    assert(bsp_button_init(event_cb, &events) == ESP_OK);
+    core_callback_inflight = true;hold_barrier = 1;
+    assert(button_cleanup() == ESP_ERR_TIMEOUT);
+    /* A late acknowledgement after timeout cannot authorize an earlier deletion. */
+    hold_barrier = 0;
+    vTaskDelay(1);
+    core_callback_inflight = true;
+    assert(button_cleanup() == ESP_OK);
+    assert_clean();
+}
+
 int main(void) {
+    check_cleanup_quiescence();
     for (int i = 1; i <= BSP_BTN_COUNT; ++i) {
         reset_faults(); fail_create = i;
         assert(bsp_button_init(event_cb, &events) != ESP_OK); retry_success();

@@ -85,7 +85,7 @@ static uint8_t s_lab_idx = 0;
 static uint8_t s_wifi_idx = 0;
 static uint8_t s_fido_acc_idx = 0;
 static bool s_fido_acc_confirm = false;
-static char s_fido_rps[AUTH_MAX_FIDO_RPS][AUTH_FIDO_RP_KEY_MAX];
+static auth_fido_site_t s_fido_rps[AUTH_MAX_FIDO_RPS];
 static uint8_t s_fido_rp_count = 0;
 static bool s_wipe_confirm = false;
 static bool s_fido_reset_confirm = false;
@@ -800,6 +800,7 @@ static void auth_app_task(void *param)
                         .uncertainty_us = cmd->time_reference_uncertainty_us,
                         .hrt_us = cmd->time_reference_hrt_us,
                         .quality = cmd->time_reference_quality,
+                        .max_age_us = cmd->time_reference_precise ? 5000000 : 0,
                     };
                     ok = auth_set_reference_timestamp(&s_cfg, &reference);
                 } else {
@@ -1238,11 +1239,14 @@ static void auth_app_task(void *param)
                         s_fido_acc_confirm = false;
                         sound_click();
                     } else if (btn == BSP_BTN_OK && s_fido_rp_count > 0) {
-                        if (!s_fido_acc_confirm) {
+                        if (s_fido_rps[s_fido_acc_idx].legacy) {
+                            s_fido_acc_confirm = false;
+                            sound_fail();
+                        } else if (!s_fido_acc_confirm) {
                             s_fido_acc_confirm = true;
                             sound_click();
                         } else {
-                            if (auth_storage_fido_delete(s_fido_rps[s_fido_acc_idx])) {
+                            if (auth_storage_fido_delete(s_fido_rps[s_fido_acc_idx].rp_id)) {
                                 s_fido_rp_count = auth_storage_fido_list(s_fido_rps, AUTH_MAX_FIDO_RPS);
                                 if (s_fido_rp_count == 0) {
                                     s_fido_acc_idx = 0;
@@ -1501,7 +1505,7 @@ void app_main(void)
     }
 
     /* 9. 所有启动路径都先隔离已有手势；初始化后仅由按键定时器确认整板空闲。 */
-    bsp_button_init(on_key, NULL);
+    ESP_ERROR_CHECK(bsp_button_init(on_key, NULL));
     s_input_ready = true;
 
     /* 10. LVGL Initialization & UI Creation */

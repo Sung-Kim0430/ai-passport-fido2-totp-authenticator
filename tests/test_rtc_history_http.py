@@ -87,7 +87,7 @@ int main(void) {
  assert(sizeof s_history_mailbox<=1024);fprintf(stderr,"mailbox=%zu summary=%zu page=%zu\n",sizeof s_history_mailbox,sizeof(rtc_clock_history_summary_t),sizeof(rtc_history_page_t));return 0;
 }
 '''
-        with tempfile.TemporaryDirectory(dir=os.environ['COMMANDCODE_SCRATCHPAD']) as directory:
+        with tempfile.TemporaryDirectory(dir=os.environ.get('COMMANDCODE_SCRATCHPAD')) as directory:
             c = Path(directory) / 'history.c'
             binary = Path(directory) / 'history'
             c.write_text(context + support + main)

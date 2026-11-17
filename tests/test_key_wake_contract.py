@@ -59,6 +59,7 @@ class KeyWakeGuardWiringTest(unittest.TestCase):
         self.assertRegex(body, r"(?m)^    key_guard_arm\(&s_key_guard\);$")
         self.assertNotIn("s_key_guard", body[body.index("bsp_button_init("):])
         self.assertNotIn("bsp_button_read_mv(", body)
+        self.assertIn("ESP_ERROR_CHECK(bsp_button_init(on_key, NULL))", body)
         self.assertNotIn("KEY_GUARD_MAX_US", self.main)
 
     def test_guard_has_one_timer_context_writer_after_init_starts(self) -> None:
@@ -77,7 +78,11 @@ class KeyWakeGuardWiringTest(unittest.TestCase):
         body = function_body(self.bsp, "register_callbacks")
         self.assertEqual(body.count("iot_button_register_cb("), 6)
         self.assertRegex(body, r"BUTTON_PRESS_END,\s*NULL,\s*cb_end,\s*index")
-        self.assertNotRegex(self.bsp, r"(?:xTaskCreate\w*|esp_timer_create|malloc|calloc|realloc)\s*\(")
+        self.assertNotRegex(self.bsp, r"(?:xTaskCreate\w*|malloc|calloc|realloc)\s*\(")
+        # The only BSP timer is a one-shot teardown barrier, never extra ADC polling.
+        self.assertEqual(self.bsp.count("esp_timer_create("), 1)
+        self.assertNotIn("esp_timer_start_periodic(", self.bsp)
+        self.assertRegex(self.bsp, r"dispatch_method\s*=\s*ESP_TIMER_TASK")
         self.assertNotRegex(self.bsp, r"enable_power_save\s*=\s*(?:true|1)|iot_button_\w*power_save")
         self.assertNotRegex(self.bsp, r"iot_button_get_(?:event|key_level|pressed_time)\s*\(")
         code = re.sub(r"//[^\n]*|/\*[\s\S]*?\*/", "", self.bsp)

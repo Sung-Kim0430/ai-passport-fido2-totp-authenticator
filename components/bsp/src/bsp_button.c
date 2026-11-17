@@ -170,6 +170,50 @@ static void cb_end(void *a, void *u) {
     s_active_gestures &= (uint8_t)~(1u << (unsigned)(uintptr_t)u);
 }
 
+// The component owns a private shared ESP_TIMER_TASK timer. Stopping it prevents
+// future polls but does not wait for an already dispatched core callback. A
+// sentinel on the same serial timer task proves that whole callback has returned.
+static esp_timer_handle_t s_cleanup_barrier;
+static volatile bool s_cleanup_ack;
+static void cleanup_barrier_done(void *arg) {
+    (void)arg;
+    s_cleanup_ack = true;
+}
+
+static esp_err_t button_wait_quiet(void) {
+    bool has_buttons = false;
+    for (int i = 0; i < BSP_BTN_COUNT; ++i) has_buttons |= s_btn[i] != NULL;
+    if (!has_buttons) return ESP_OK;
+    esp_err_t err = iot_button_stop();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    if (!s_cleanup_barrier) {
+        const esp_timer_create_args_t args = {
+            .callback = cleanup_barrier_done,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "btn_quiet",
+        };
+        err = esp_timer_create(&args, &s_cleanup_barrier);
+        if (err != ESP_OK) return err;
+    }
+    // A timed-out attempt may still have a pending sentinel. Drain it before
+    // resetting its static acknowledgement, so retries cannot accept a stale one.
+    err = esp_timer_stop_blocking(s_cleanup_barrier, pdMS_TO_TICKS(200));
+    if (err != ESP_OK) return err;
+    s_cleanup_ack = false;
+    err = esp_timer_start_once(s_cleanup_barrier, 1);
+    if (err != ESP_OK) return err;
+    const int64_t deadline = esp_timer_get_time() + 200000;
+    while (!s_cleanup_ack) {
+        if (esp_timer_get_time() >= deadline) return ESP_ERR_TIMEOUT;
+        vTaskDelay(1);
+    }
+    err = esp_timer_stop_blocking(s_cleanup_barrier, pdMS_TO_TICKS(200));
+    if (err != ESP_OK) return err;
+    err = esp_timer_delete(s_cleanup_barrier);
+    if (err == ESP_OK) s_cleanup_barrier = NULL;
+    return err;
+}
+
 // 初始化中途失败时先停掉所有 button driver，再释放本文件持有的校准与 ADC unit。
 // button driver 仍在轮询时不能先删 ADC，否则 timer callback 会访问失效句柄。
 // 返回 ESP_OK 表示按键、校准与 ADC unit 都已完整回收；否则返回首个错误码，
@@ -179,6 +223,8 @@ static esp_err_t button_cleanup(void) {
     s_cb = NULL;
     s_user = NULL;
     s_ready = false;
+    const esp_err_t quiet = button_wait_quiet();
+    if (quiet != ESP_OK) return quiet;
     s_sample_valid = false;
     s_sample_time = 0;
     s_sample_mv = -1;

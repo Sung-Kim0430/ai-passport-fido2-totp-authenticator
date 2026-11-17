@@ -24,6 +24,9 @@ typedef struct {
     uint8_t pin_uv_auth_protocol;
     bool    uv_requested;
     bool    rk_requested;
+    /* Borrowed encoded allowList; copy before the receive buffer is reused. */
+    const uint8_t *allow_list;
+    size_t allow_list_len;
 } fido_auth_params_t;
 
 typedef enum {
@@ -85,10 +88,13 @@ typedef struct {
     uint8_t otp_period;
     bool time_reference_present;
     bool time_reference_quality;
+    bool time_reference_precise;
     uint64_t time_reference_id;
     uint64_t time_reference_utc_us;
     int64_t time_reference_hrt_us;
     uint64_t time_reference_uncertainty_us;
+    uint64_t time_reference_transport_uncertainty_us;
+    uint64_t time_reference_phone_uncertainty_us;
 } fido_parsed_cmd_t;
 
 void fido_session_init(fido_session_t *session);
@@ -143,6 +149,10 @@ bool ctap2_parse_get_assertion(const uint8_t *payload, size_t len,
                                uint8_t out_cdh[32],
                                uint8_t *out_allow_id, size_t *out_allow_id_len,
                                fido_auth_params_t *out_auth);
+
+/** Match every descriptor in an encoded allowList with bounded iteration. */
+bool ctap2_allow_list_contains(const uint8_t *list, size_t len,
+                               const uint8_t *credential, size_t credential_len);
 
 /**
  * @brief Build canonical CBOR response for authenticatorMakeCredential.

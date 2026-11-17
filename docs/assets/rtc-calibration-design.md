@@ -440,3 +440,15 @@ Only the approved 3072-byte partition table at `0x8000` and 1,872,464-byte appli
 A single bounded startup capture before any new reference baseline observed the expected application ELF prefix `92d4d6be2…`, version `bd5f43c-dirty`, USB_UART_CHIP_RESET and the deliberately preserved ESP-IDF 5.5.3 bootloader. No panic/abort/brownout or explicit error marker appeared in the captured window, but the application-initialization-complete marker was not captured. The serial handle was closed and released; do not reopen it after establishing the next clock baseline. Raw device logs remain only in session scratch.
 
 Build: PASS and Host tests: PASS for the unchanged verified artifact. Flash/data-hash verification and startup application identity: PASS. Device tests: NOT RUN for the functional/accuracy acceptance matrix. Unverified: visible startup/unlock, original accounts/PIN, the RTC-history web view and source-specific saved coefficient, native heap/stack, repeated maintenance/user wakes, power cuts and multi-day/30-day precision. Confirm UI/account preservation first, then explicitly synchronize from an accurately set phone to establish a new baseline; initial history may be empty. Successful flashing is not functional or monthly-precision acceptance.
+
+## Millisecond phone synchronization follow-up
+
+The [approved synchronization plan](phone-time-sync-plan.md) replaces the current
+page's single status probe with 12 bounded four-timestamp exchanges, handler-time
+subtraction and a median offset from consistent low-delay samples. A successful
+batch submits one reference; failed batches do not set time. Legacy pages keep
+their original protocol. The endpoint cache is separate from status polling,
+and version-2 references expire in both the HTTP and owner stages. Transport
+uncertainty and the assumed one-second phone UTC bound remain separate metadata,
+combined conservatively for the existing learning interface. This change neither
+activates shadow coefficients nor proves millisecond absolute UTC accuracy.

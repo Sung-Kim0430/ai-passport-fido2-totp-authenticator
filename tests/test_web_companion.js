@@ -42,82 +42,135 @@ run('accountRevision=7;editAccount(accounts[0]);accountRevision=8;');
 assert.equal(run('editingRevision'),7);
 assert.equal(run('editing'),0);
 async function timeReferenceTests() {
-  assert.equal(run('typeof syncBrowserTime'), 'function');
-  assert.equal(html.includes("$('syncTime').addEventListener('click', syncBrowserTime)"), true);
-  const realRequest=run('request'), realSend=run('sendCommand');
-  const realUpdate=run('updateStatus'), realLoad=run('loadAccounts');
-  for(const signal of [undefined,{}]) {
-    context.AbortSignal=signal;
-    context.fetch=async(route,options)=>{assert.equal(route,'/api/status');assert.equal(options.cache,'no-store');return {ok:true,json:async()=>({oldChrome:true})};};
-    assert.equal((await run("request('/api/status')")).oldChrome,true);
-  }
-  context.AbortSignal=AbortSignal;
+  assert.equal(run('typeof timeSyncSample'), 'function');
+  assert.equal(run('typeof selectTimeSyncReference'), 'function');
   const base = 1700000000000;
-  const probe = {id:17,hrt_us:12345,window_us:20,valid:true};
-  async function sync({wall=[base,base+40,base+80],mono=[100,140.0005],sample=probe,performance=true,failGet=false}={}) {
-    const calls=[];
-    context.Date = {now:()=>wall.shift()};
-    context.performance = performance ? {now:()=>mono.shift()} : undefined;
-    context.captureRequest = async route => { calls.push(route); if(failGet) throw new Error('offline'); return {unlocked:true,session:'fresh',time_probe:sample}; };
-    context.captureSend = async payload => { calls.push(JSON.parse(JSON.stringify(payload))); };
-    run("request=captureRequest;sendCommand=captureSend;status={unlocked:true,session:'old'};connected=true;busy=false;");
-    await run('syncBrowserTime()');
-    assert.equal(calls[0], '/api/status');
-    assert.equal(calls[1].command,'SYNC_TIME');
-    assert.equal(calls[1].value,Math.floor((base+80)/1000));
-    return calls[1];
+  function sample(id=1, up=4000, down=4000, processing=20000, offset=0) {
+    const elapsed = up + processing + down;
+    return {probe:{version:2,id,received_us:up,sent_us:up+processing,valid:true},
+      wallBeforeMs:base+offset/1000,wallAfterMs:base+(offset+elapsed)/1000,
+      monoBeforeMs:100,monoAfterMs:100+elapsed/1000};
   }
-  const good=await sync();
-  assert.equal(good.reference_probe_id,17);
-  assert.equal(good.reference_utc_us,1700000000020000);
-  assert.equal(good.reference_rtt_us,40001);
-  assert.equal(good.reference_clock_delta_us,40000);
-  assert.match(elements.get('notice').textContent,/不保证/);
-  for(const options of [
-    {sample:undefined,failGet:true},{sample:null},{sample:{...probe,valid:false}},
-    {sample:{...probe,id:0}},{sample:{...probe,id:2**32}},
-    {sample:{...probe,hrt_us:-1}},{sample:{...probe,window_us:1001}},
-    {sample:{...probe,window_us:0.5}},{sample:{...probe,hrt_us:Infinity}},
-    {wall:[base,base+141,base+80]}, {mono:[100,2101]}, {mono:[140,100]},
-    {performance:false},{wall:[0,40,base+80]}
-  ]) {
-    const legacy=await sync(options);
-    assert.equal('reference_probe_id' in legacy,false);
-    assert.match(elements.get('notice').textContent,/未提供/);
+  const evaluate = value => run(`timeSyncSample(${JSON.stringify(value)})`);
+  const good=evaluate(sample());
+  assert.equal(good.networkUs,8000);
+  assert.equal(good.offsetUs,base*1000);
+  assert.equal(good.rttUs,28000);
+  const slow=evaluate(sample(2,4000,4000,200000));
+  assert.equal(slow.networkUs,8000);assert.equal(slow.offsetUs,base*1000);
+  const samples=Array.from({length:12},(_,i)=>evaluate(sample(i+1,4000,4000,20000,(i%3-1)*500)));
+  samples[0]=evaluate(sample(1,100000,4000));
+  context.timeSamples=samples;
+  const chosen=run('selectTimeSyncReference(timeSamples)');
+  assert.equal(chosen.payload.reference_version,2);
+  assert.equal(chosen.payload.reference_probe_id,5); // newest of the fastest third
+  assert.equal(chosen.payload.reference_utc_us,base*1000+14000);
+  assert.equal(chosen.transportUs,5500);
+  const asymmetric=evaluate(sample(10,2000,14000));
+  assert.equal(asymmetric.offsetUs-base*1000,6000);
+  context.timeSamples=Array.from({length:6},()=>asymmetric);
+  const asym=run('selectTimeSyncReference(timeSamples)');
+  assert.ok(asym.transportUs>=Math.abs(asymmetric.offsetUs-base*1000));
+  context.timeSamples=samples.slice(0,5);
+  assert.throws(()=>run('selectTimeSyncReference(timeSamples)'),/样本/);
+  context.timeSamples=Array.from({length:6},(_,i)=>evaluate(sample(i+1,4000,4000,20000,i*30000)));
+  assert.throws(()=>run('selectTimeSyncReference(timeSamples)'),/稳定/);
+  for (const mutate of [
+    x=>x.probe.valid=false,x=>x.probe.version=1,x=>x.probe.id=0,
+    x=>x.probe.received_us=-1,x=>x.probe.sent_us=1,
+    x=>x.probe.sent_us=2**53,x=>x.probe.sent_us=1.5,
+    x=>x.monoAfterMs=99,x=>x.monoAfterMs=1000,
+  ]) { const x=sample();mutate(x);assert.equal(evaluate(x),null); }
+  assert.throws(()=>evaluate({...sample(),wallAfterMs:base+1000}),/时间/);
+
+  const realRequest=run('request'),realSend=run('sendCommand');
+  const realUpdate=run('updateStatus'),realLoad=run('loadAccounts');
+  let mono=1000,wall=base,index=0,calls=[],posts=[],mode='good',pending;
+  context.Date=class extends Date {static now(){return wall;}};
+  context.performance={now:()=>mono};
+  function reset(next='good') {
+    mode=next;mono=1000;wall=base;index=0;calls=[];posts=[];document.hidden=next==='hidden';
+    run("connected=true;status={unlocked:true,session:'original',device_id:'test'};busy=false;");
   }
-  let sends=0;
-  context.captureSend=async()=>{sends++;};
-  run('sendCommand=captureSend;connected=false;');
-  await run('syncBrowserTime()');
-  assert.equal(sends,0);
+  context.captureRequest=async route=>{
+    calls.push(route);
+    if(route==='/api/status')return {unlocked:mode!=='locked',session:mode==='session'?'changed':'original',device_id:'test'};
+    assert.equal(route,'/api/time-probe');
+    assert.equal(run('busy'),true);
+    if(mode==='pending' && index===0){await new Promise(resolve=>pending=resolve);}
+    index++;
+    if(mode==='midlock' && index===4)run('status.unlocked=false');
+    if(mode==='midsession' && index===4)run("status.session='changed'");
+    if(mode==='failedstep' && index===4){wall+=1000;throw new Error('timeout');}
+    if(mode==='offline')throw new Error('timeout');
+    const received=Math.round(mono*1000)+4000;
+    mono+=28;wall+=28;
+    if(mode==='clockstep' && index===4)wall+=1000;
+    return {version:2,id:index,received_us:received,sent_us:received+20000,valid:mode!=='invalid'};
+  };
+  context.captureSend=async payload=>{posts.push(JSON.parse(JSON.stringify(payload)));};
+  run('request=captureRequest;sendCommand=captureSend;');
+  reset();await run('syncBrowserTime()');
+  assert.equal(posts.length,1);assert.equal(index,12);
+  assert.equal(posts[0].reference_version,2);
+  assert.equal(posts[0].reference_probe_id,4);
+  assert.equal(posts[0].reference_rtt_us,28000);
+  assert.match(elements.get('notice').textContent,/手机/);
+  assert.equal(run('busy'),false);
+  for(const bad of ['offline','invalid','clockstep','session','locked','hidden','midlock','midsession','failedstep']) {
+    reset(bad);await run('syncBrowserTime()');
+    assert.equal(posts.length,0,bad);assert.equal(run('busy'),false);
+    assert.ok(elements.get('error').textContent,bad);
+  }
+  reset('pending');const first=run('syncBrowserTime()');
+  await Promise.resolve();await run('syncBrowserTime()');
+  assert.equal(run('busy'),true);assert.equal(posts.length,0);
+  pending();await first;assert.equal(posts.length,1);assert.equal(run('busy'),false);
+
+  // Run real POST + acknowledgement path, with one POST and authenticated probes.
   context.request=realRequest;context.sendCommand=realSend;
   context.updateStatus=realUpdate;context.loadAccounts=realLoad;
-  const wall=[base,base+40,base+80];
-  context.Date=class extends Date {static now(){return wall.length ? wall.shift() : base+80;}};
-  const mono=[100,140];context.performance={now:()=>mono.shift()};
-  const routes=[];let posted;
-  const fullStatus={unlocked:true,session:'fresh-session',time:1700000000,device_id:'test',ssid:'test',heap:100000,largest_block:50000,brightness:80,sound:true,time_probe:probe,results:[{id:91,ok:true}]};
+  context.AbortController=AbortController;context.clearTimeout=clearTimeout;
+  context.setTimeout=(callback,ms)=>ms===200 ? setTimeout(callback,0) : setTimeout(callback,ms);
+  const fullStatus={unlocked:true,session:'original',time:1700000000,device_id:'test',ssid:'test',heap:100000,largest_block:50000,brightness:80,sound:true,results:[{id:91,ok:true}]};
   context.fetch=async(route,options)=>{
-    routes.push(route);
-    if(route==='/api/command') {
-      assert.equal(options.method,'POST');
-      assert.equal(options.headers['X-Passport-Session'],'fresh-session');
-      posted=JSON.parse(options.body);return {ok:true,json:async()=>({queued:true,id:91})};
+    calls.push(route);
+    if(route==='/api/time-probe') {
+      if((mode==='http403'||mode==='http423') && index===4)return {ok:false,status:mode==='http403'?403:423,text:async()=> 'Session or lock changed'};
+      assert.equal(options.headers['X-Passport-Session'],'original');
+      const received=Math.round(mono*1000)+4000;mono+=28;wall+=28;index++;
+      return {ok:true,json:async()=>({version:2,id:index,received_us:received,sent_us:received+20000,valid:true})};
     }
-    return {ok:true,json:async()=>route==='/api/accounts' ? {revision:3,accounts:[]} : fullStatus};
+    if(route==='/api/command') {
+      posts.push(JSON.parse(options.body));
+      if(mode==='postfailure')throw new Error('ambiguous POST');
+      return {ok:true,json:async()=>({queued:true,id:91})};
+    }
+    if(mode==='resulttimeout' && route==='/api/status' && posts.length){mono+=7000;wall-=7000;return {ok:true,json:async()=>({...fullStatus,results:[]})};}
+    return {ok:true,json:async()=>route==='/api/accounts'?{revision:3,accounts:[]}:fullStatus};
   };
-  context.setTimeout=callback=>{callback();};
-  run("connected=true;status={unlocked:true,session:'old-session'};");
+  for(const next of ['good','postfailure','resulttimeout']) {
+    reset(next);await run('syncBrowserTime()');
+    assert.equal(posts.length,1,next);assert.equal(run('busy'),false);
+    if(next!=='good')assert.ok(elements.get('error').textContent,next);
+  }
+  for(const next of ['http403','http423']) {
+    reset(next);await run('syncBrowserTime()');
+    assert.equal(posts.length,0);assert.equal(index,4);assert.equal(run('busy'),false);
+  }
+  reset('stalledprobe');let aborted=0;
+  context.fetch=async route=>route==='/api/status' ? {ok:true,json:async()=>fullStatus} : new Promise(()=>{});
+  context.setTimeout=(callback,ms)=>setTimeout(()=>{mono+=ms;wall+=ms;aborted++;callback();},0);
   await run('syncBrowserTime()');
-  assert.deepEqual(routes,['/api/status','/api/command','/api/status','/api/accounts']);
-  assert.equal(posted.reference_probe_id,17);
-  assert.equal(posted.reference_utc_us,1700000000020000);
-  assert.equal(posted.reference_rtt_us,40000);
-  assert.equal(posted.value,1700000000);
-  routes.length=0;context.setTimeout=()=>{};
-  await run('poll()');
-  assert.deepEqual(routes,['/api/status']);
-  console.log('Web explicit time reference, clock-step and legacy fallback: PASS');
+  assert.equal(posts.length,0);assert.equal(run('busy'),false);assert.equal(aborted,6);
+  context.setTimeout=setTimeout;
+  // Deadline includes a response body that never settles, even without AbortSignal.timeout.
+  context.fetch=async()=>({ok:true,json:()=>new Promise(()=>{})});
+  await assert.rejects(()=>run("request('/api/time-probe',{},5)"),/超时/);
+  context.fetch=()=>new Promise(()=>{});
+  await assert.rejects(()=>run("request('/api/time-probe',{},5)"),/超时/);
+  context.setTimeout=()=>{};
+  console.log('Web four-timestamp selection, clock steps, bounded requests, one POST and cleanup: PASS');
 }
 console.log('Web URI import, Steam conversion, validation, XSS-safe rendering: PASS');
 async function historyTests() {

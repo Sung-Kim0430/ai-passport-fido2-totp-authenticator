@@ -5,6 +5,7 @@
 #include "auth_ble.h"
 #include "fido_protocol.h"
 #include "fido_pin.h"
+#include "auth_fido_store.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -54,6 +55,7 @@ static const uint8_t s_aaguid[16] = { 0 };
  * by some mobile CTAP2-over-BLE clients. authData is 145 bytes + credIdLen, so
  * a 4-byte credential ID yields a 149-byte response (8 notifications at MTU 23). */
 #define FIDO_CRED_ID_LEN 4
+#define CTAP_MAX_MSG_LEN 1024
 
 /* Official FIDO GATT Service UUID: 0xFFFD */
 static const ble_uuid16_t s_svc_uuid = BLE_UUID16_INIT(0xFFFD);
@@ -109,52 +111,79 @@ static TaskHandle_t s_ble_host_task = NULL;
 static uint8_t s_fido_master_seed[32];
 static bool s_master_seed_loaded = false;
 
-static void ensure_master_seed(void)
+static void clear_key_bytes(void *data, size_t len)
 {
-    if (s_master_seed_loaded) return;
+    volatile uint8_t *p = data;
+    while (len--) *p++ = 0;
+}
+
+static bool load_fido_material(const char *key, uint8_t *data, size_t size, bool create)
+{
     nvs_handle_t h;
     esp_err_t err = nvs_open("fido_sec", NVS_READWRITE, &h);
-    if (err == ESP_OK) {
-        size_t len = sizeof(s_fido_master_seed);
-        err = nvs_get_blob(h, "seed", s_fido_master_seed, &len);
-        if (err != ESP_OK || len != 32) {
-            esp_fill_random(s_fido_master_seed, 32);
-            nvs_set_blob(h, "seed", s_fido_master_seed, 32);
-            nvs_commit(h);
-        }
-        nvs_close(h);
-    } else {
-        esp_fill_random(s_fido_master_seed, 32);
+    if (err != ESP_OK) {
+        clear_key_bytes(data, size);
+        return false;
     }
-    s_master_seed_loaded = true;
+    size_t len = size;
+    err = nvs_get_blob(h, key, data, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND && create) {
+        esp_fill_random(data, size);
+        err = nvs_set_blob(h, key, data, size);
+    } else if (err == ESP_OK && len != size) {
+        err = ESP_FAIL;
+    }
+    // Also confirm readable material: a previous failed commit may have left
+    // pending data in the backend. A successful read alone is not durability.
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) clear_key_bytes(data, size);
+    return err == ESP_OK;
+}
+
+static bool next_fido_counter(uint32_t *counter)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open("fido_sec", NVS_READWRITE, &h);
+    if (err != ESP_OK) return false;
+    uint32_t value = 0;
+    err = nvs_get_u32(h, "sign_ctr", &value);
+    if (err == ESP_ERR_NVS_NOT_FOUND) { value = 0; err = ESP_OK; }
+    if (err == ESP_OK && value == UINT32_MAX) err = ESP_FAIL;
+    if (err == ESP_OK) err = nvs_set_u32(h, "sign_ctr", ++value);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) *counter = value;
+    return err == ESP_OK;
+}
+
+static bool ensure_master_seed(void)
+{
+    if (s_master_seed_loaded) return true;
+    s_master_seed_loaded = load_fido_material("seed", s_fido_master_seed,
+                                             sizeof(s_fido_master_seed), true);
+    return s_master_seed_loaded;
 }
 
 void auth_ble_reload_seed(void)
 {
-    memset(s_fido_master_seed, 0, sizeof(s_fido_master_seed));
+    clear_key_bytes(s_fido_master_seed, sizeof(s_fido_master_seed));
     s_master_seed_loaded = false;
 }
 
-static void derive_fido_key(const char *rpid, uint8_t out_priv[32],
-                            uint8_t *out_cred_id, size_t cred_id_len)
+static bool derive_fido_key(const char *rpid, uint8_t out_priv[32],
+                            uint8_t *out_cred_id, size_t cred_id_len, bool create)
 {
-    ensure_master_seed();
+    memset(out_priv, 0, 32);
+    memset(out_cred_id, 0, cred_id_len);
+    if (!ensure_master_seed()) return false;
 
-    /* Per-RP salt: deleting it revokes the old credential without touching
-     * other relying parties. */
-    uint8_t salt[16] = { 0 };
-    char salt_key[16];
-    snprintf(salt_key, sizeof(salt_key), "s_%.12s", rpid);
-    nvs_handle_t h;
-    if (nvs_open("fido_sec", NVS_READWRITE, &h) == ESP_OK) {
-        size_t len = sizeof(salt);
-        if (nvs_get_blob(h, salt_key, salt, &len) != ESP_OK || len != sizeof(salt)) {
-            esp_fill_random(salt, sizeof(salt));
-            nvs_set_blob(h, salt_key, salt, sizeof(salt));
-            nvs_commit(h);
-        }
-        nvs_close(h);
-    }
+    /* The salt is migrated unchanged; the derivation remains compatible. */
+    auth_fido_record_t record;
+    if (auth_fido_load(rpid, create, &record) != AUTH_FIDO_OK) return false;
+    uint8_t salt[16];
+    memcpy(salt, record.salt, sizeof(salt));
+    clear_key_bytes(&record, sizeof(record));
 
     uint8_t msg[128];
     size_t rlen = strlen(rpid);
@@ -165,22 +194,25 @@ static void derive_fido_key(const char *rpid, uint8_t out_priv[32],
     memcpy(msg, "priv", 4);
     memcpy(msg + 4, rpid, rlen);
     memcpy(msg + 4 + rlen, salt, sizeof(salt));
-    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                    s_fido_master_seed, 32,
-                    msg, 4 + rlen + sizeof(salt),
-                    out_priv);
+    int err = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                               s_fido_master_seed, 32,
+                               msg, 4 + rlen + sizeof(salt), out_priv);
 
     out_priv[0] &= 0x7F;
     if (out_priv[0] == 0) out_priv[0] = 1;
 
     uint8_t full_cred_id[32];
     memcpy(msg, "cred", 4);
-    mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                    s_fido_master_seed, 32,
-                    msg, 4 + rlen + sizeof(salt),
-                    full_cred_id);
-    if (cred_id_len > sizeof(full_cred_id)) cred_id_len = sizeof(full_cred_id);
-    memcpy(out_cred_id, full_cred_id, cred_id_len);
+    if (!err) err = mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                                   s_fido_master_seed, 32,
+                                   msg, 4 + rlen + sizeof(salt), full_cred_id);
+    if (cred_id_len > sizeof(full_cred_id)) err = -1;
+    if (!err) memcpy(out_cred_id, full_cred_id, cred_id_len);
+    else clear_key_bytes(out_priv, 32);
+    clear_key_bytes(full_cred_id, sizeof(full_cred_id));
+    clear_key_bytes(salt, sizeof(salt));
+    clear_key_bytes(msg, sizeof(msg));
+    return err == 0;
 }
 
 /* Fragmented CTAP BLE notification sender */
@@ -255,8 +287,8 @@ static char s_pending_rpid[64] = "webauthn.io";
 static char s_pending_username[64] = "Passkey User";
 static uint8_t s_pending_user_id[64] = {0};
 static size_t s_pending_user_id_len = 0;
-static uint8_t s_pending_allow_id[64] = {0};
-static size_t s_pending_allow_len = 0;
+static uint8_t s_pending_allow_list[CTAP_MAX_MSG_LEN];
+static size_t s_pending_allow_list_len;
 static uint8_t s_pending_rpid_hash[32];
 static uint8_t s_pending_cdh[32];
 static volatile bool s_pending_uv = false;
@@ -302,12 +334,17 @@ static void send_fido2_make_credential_response(const char *rpid, const uint8_t 
 {
     (void)cdh;
     uint8_t priv[32], cred_id[FIDO_CRED_ID_LEN];
-    derive_fido_key(rpid, priv, cred_id, sizeof(cred_id));
+    if (!derive_fido_key(rpid, priv, cred_id, sizeof(cred_id), true)) {
+        const uint8_t error = 0x7f; /* CTAP2_ERR_OTHER: stable key material unavailable. */
+        ble_send_ctap_frame(0x83, &error, 1);
+        return;
+    }
 
     mbedtls_ecdsa_context ctx;
     mbedtls_ecdsa_init(&ctx);
     mbedtls_ecp_group_load(&ctx.grp, MBEDTLS_ECP_DP_SECP256R1);
     mbedtls_mpi_read_binary(&ctx.d, priv, 32);
+    clear_key_bytes(priv, sizeof(priv));
     mbedtls_ecp_mul(&ctx.grp, &ctx.Q, &ctx.d, &ctx.grp.G, auth_mbedtls_rng, NULL);
 
     uint8_t qx[32], qy[32];
@@ -315,15 +352,12 @@ static void send_fido2_make_credential_response(const char *rpid, const uint8_t 
     mbedtls_mpi_write_binary(&ctx.Q.Y, qy, 32);
     mbedtls_ecdsa_free(&ctx);
 
-    /* Persist user ID for discoverable credentials */
+    /* Success requires the user handle to be durable as well as the key. */
     if (s_pending_user_id_len > 0) {
-        nvs_handle_t h;
-        if (nvs_open("fido_sec", NVS_READWRITE, &h) == ESP_OK) {
-            char key[16];
-            snprintf(key, sizeof(key), "u_%.12s", rpid);
-            nvs_set_blob(h, key, s_pending_user_id, s_pending_user_id_len);
-            nvs_commit(h);
-            nvs_close(h);
+        if (!auth_fido_save_user(rpid, s_pending_user_id, s_pending_user_id_len)) {
+            const uint8_t error = 0x7f;
+            ble_send_ctap_frame(0x83, &error, 1);
+            return;
         }
     }
 
@@ -341,29 +375,28 @@ static void send_fido2_make_credential_response(const char *rpid, const uint8_t 
 static void send_fido2_get_assertion_response(const char *rpid, const uint8_t rpid_hash[32], const uint8_t cdh[32])
 {
     uint32_t sign_count = 0;
-    nvs_handle_t ctr_h;
-    if (nvs_open("fido_sec", NVS_READWRITE, &ctr_h) == ESP_OK) {
-        if (nvs_get_u32(ctr_h, "sign_ctr", &sign_count) != ESP_OK) {
-            sign_count = 0;
-        }
-        sign_count++;
-        nvs_set_u32(ctr_h, "sign_ctr", sign_count);
-        nvs_commit(ctr_h);
-        nvs_close(ctr_h);
-    } else {
-        static uint32_t fallback_counter = 0;
-        sign_count = ++fallback_counter;
-    }
     const uint8_t auth_flags = s_pending_uv ? 0x05 : 0x01; /* UP | UV when verified */
 
     uint8_t priv[32], cred_id[FIDO_CRED_ID_LEN];
-    derive_fido_key(rpid, priv, cred_id, sizeof(cred_id));
+    if (!derive_fido_key(rpid, priv, cred_id, sizeof(cred_id), false)) {
+        const uint8_t error = 0x7f;
+        ble_send_ctap_frame(0x83, &error, 1);
+        return;
+    }
 
-    if (s_pending_allow_len > 0 &&
-        (s_pending_allow_len != sizeof(cred_id) ||
-         memcmp(s_pending_allow_id, cred_id, sizeof(cred_id)) != 0)) {
+    if (s_pending_allow_list_len &&
+        !ctap2_allow_list_contains(s_pending_allow_list, s_pending_allow_list_len,
+                                   cred_id, sizeof(cred_id))) {
+        clear_key_bytes(priv, sizeof(priv));
         const uint8_t err = 0x2E; /* CTAP2_ERR_NO_CREDENTIALS */
         ble_send_ctap_frame(0x83, &err, 1);
+        return;
+    }
+
+    if (!next_fido_counter(&sign_count)) {
+        clear_key_bytes(priv, sizeof(priv));
+        const uint8_t error = 0x7f;
+        ble_send_ctap_frame(0x83, &error, 1);
         return;
     }
 
@@ -371,6 +404,7 @@ static void send_fido2_get_assertion_response(const char *rpid, const uint8_t rp
     mbedtls_ecdsa_init(&ctx);
     mbedtls_ecp_group_load(&ctx.grp, MBEDTLS_ECP_DP_SECP256R1);
     mbedtls_mpi_read_binary(&ctx.d, priv, 32);
+    clear_key_bytes(priv, sizeof(priv));
     mbedtls_ecp_mul(&ctx.grp, &ctx.Q, &ctx.d, &ctx.grp.G, auth_mbedtls_rng, NULL);
 
     /* authData (37 bytes): rpIdHash (32) + flags (1) + signCount (4) */
@@ -394,27 +428,21 @@ static void send_fido2_get_assertion_response(const char *rpid, const uint8_t rp
     mbedtls_ecdsa_write_signature(&ctx, MBEDTLS_MD_SHA256, hash, sizeof(hash), sig_der, sizeof(sig_der), &sig_len, auth_mbedtls_rng, NULL);
     mbedtls_ecdsa_free(&ctx);
 
-    /* Load user ID from NVS if available */
-    uint8_t uid[64];
-    size_t uid_len = sizeof(uid);
-    bool has_uid = false;
-    nvs_handle_t h;
-    if (nvs_open("fido_sec", NVS_READONLY, &h) == ESP_OK) {
-        char key[16];
-        snprintf(key, sizeof(key), "u_%.12s", rpid);
-        if (nvs_get_blob(h, key, uid, &uid_len) == ESP_OK) {
-            has_uid = true;
-        }
-        nvs_close(h);
+    auth_fido_record_t record;
+    if (auth_fido_load(rpid, false, &record) != AUTH_FIDO_OK) {
+        const uint8_t error = 0x7f;
+        ble_send_ctap_frame(0x83, &error, 1);
+        return;
     }
 
     uint8_t cbor_resp[384];
     size_t cr = ctap2_build_get_assertion_resp(rpid_hash, cred_id, sizeof(cred_id),
                                                 auth_flags, sign_count,
                                                 sig_der, sig_len,
-                                                has_uid ? uid : NULL, has_uid ? uid_len : 0,
+                                                record.user_len ? record.user_id : NULL, record.user_len,
                                                 cbor_resp, sizeof(cbor_resp));
 
+    clear_key_bytes(&record, sizeof(record));
     ESP_LOGI(TAG, "Sending FIDO2 GetAssertion response (%u bytes, rp=%s)", (unsigned int)cr, rpid);
     ble_send_ctap_frame(0x83, cbor_resp, cr);
 }
@@ -437,7 +465,6 @@ void auth_ble_fido_user_confirm(bool approved)
 }
 
 /* CTAP RX Buffer for Multi-packet Reassembly */
-#define CTAP_MAX_MSG_LEN 1024
 
 typedef struct {
     uint8_t  cmd;
@@ -594,8 +621,13 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
             ESP_LOGI(TAG, "GetAssertion rp='%s' allowIdLen=%u cdh0=%02X uvReq=%d pinAuth=%u",
                      s_pending_rpid, (unsigned)allow_id_len, s_pending_cdh[0],
                      (int)auth.uv_requested, (unsigned)auth.pin_uv_auth_param_len);
-            memcpy(s_pending_allow_id, allow_id, allow_id_len);
-            s_pending_allow_len = allow_id_len;
+            if (auth.allow_list_len > sizeof(s_pending_allow_list)) {
+                const uint8_t error = 0x15; /* CTAP2_ERR_LIMIT_EXCEEDED */
+                ble_send_ctap_frame(0x83, &error, 1);
+                return;
+            }
+            if (auth.allow_list_len) memcpy(s_pending_allow_list, auth.allow_list, auth.allow_list_len);
+            s_pending_allow_list_len = auth.allow_list_len;
 
             bool uv = false;
             if (auth.pin_uv_auth_param_len > 0) {
@@ -899,7 +931,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
             s_rx_ctx.in_progress = false;
             s_pending_op = CTAP_OP_NONE;
             s_pending_uv = false;
-            s_pending_allow_len = 0;
+            s_pending_allow_list_len = 0;
             fido_pin_reset_token();
             ESP_LOGI(TAG, "BLE connected handle=%d", s_conn_handle);
         } else {
@@ -915,7 +947,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         s_rx_ctx.in_progress = false;
         s_pending_op = CTAP_OP_NONE;
         s_pending_uv = false;
-        s_pending_allow_len = 0;
+        s_pending_allow_list_len = 0;
         fido_pin_reset_token();
         auth_ble_start_advertising();
         break;
@@ -1174,7 +1206,7 @@ bool auth_ble_stop(void)
     s_is_connected = false;
     s_pending_op = CTAP_OP_NONE;
     s_pending_uv = false;
-    s_pending_allow_len = 0;
+    s_pending_allow_list_len = 0;
     s_rx_ctx.in_progress = false;
     fido_pin_reset_token();
     if (!s_host_stopped) {

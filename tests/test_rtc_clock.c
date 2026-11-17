@@ -7,6 +7,7 @@
 
 rtc_clock_retained_t rtc_clock_retained;
 static uint64_t ticks, rtc_us;
+static int64_t uptime_step_us;
 static int64_t uptime_us, wall_us, applied_us;
 static uint32_t period;
 static int32_t temperature;
@@ -66,7 +67,7 @@ uint64_t rtc_clock_platform_ticks(void) {
     if (delayed) advance_fake(tick_delay_after_us);
     return result;
 }
-int64_t rtc_clock_platform_uptime_us(void) { return uptime_us; }
+int64_t rtc_clock_platform_uptime_us(void) { int64_t value=uptime_us; uptime_us+=uptime_step_us; return value; }
 uint64_t rtc_clock_platform_rtc_us(void) { return rtc_us; }
 bool rtc_clock_platform_get_wall_us(int64_t *out) {
     if (fail_get) return false;
@@ -484,7 +485,7 @@ static void check_maintenance_abort_and_awake(void) {
 }
 
 static rtc_clock_reference_t reference_now(uint64_t id, uint64_t utc) {
-    return (rtc_clock_reference_t){id, utc, 1000, uptime_us, true};
+    return (rtc_clock_reference_t){.id=id, .utc_us=utc, .uncertainty_us=1000, .hrt_us=uptime_us, .quality=true};
 }
 
 static void check_reference_transaction_and_coordinates(void) {
@@ -1019,6 +1020,23 @@ static void check_history_reboot_after_manifest_commit(void) {
     assert(view.active_ppm == -870 && stored_ppm == -870);
 }
 
+static void check_precise_reference_owner_expiry(void) {
+    history_test_start();
+    rtc_clock_reference_t ref = reference_now(99, history_test_utc);
+    ref.max_age_us = 5000000;
+    advance_fake(5000001);
+    unsigned before = sets;
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_FAILED);
+    assert(sets == before);
+    ref.max_age_us = 0;
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+    ref = reference_now(100, history_test_utc);
+    ref.max_age_us = 5000000;
+    before = sets; uptime_step_us = 5000001;
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_FAILED);
+    assert(sets == before); uptime_step_us = 0;
+}
+
 static void check_history_setter_environment(void) {
     history_test_start();
     history_test_restore();
@@ -1332,6 +1350,7 @@ int main(int argc, char **argv) {
     check_history_queue_and_cold();
     check_history_persistence_failures();
     check_history_reboot_after_manifest_commit();
+    check_precise_reference_owner_expiry();
     check_history_setter_environment();
     check_history_maintenance_io_isolation();
     check_awake_only_reference_transaction();

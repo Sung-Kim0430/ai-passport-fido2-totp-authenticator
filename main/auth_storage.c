@@ -455,50 +455,14 @@ bool auth_storage_wipe_all(auth_config_t *cfg)
 #define FIDO_PIN_NAMESPACE "fido_pin"
 #define FIDO_NVS_PARTITION "nvs"
 
-uint8_t auth_storage_fido_list(char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_t max_rps)
+uint8_t auth_storage_fido_list(auth_fido_site_t *rps, uint8_t max_rps)
 {
-    if (!rps || max_rps == 0) return 0;
-
-    nvs_handle_t handle;
-    if (nvs_open(FIDO_NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
-        return 0;
-    }
-
-    uint8_t count = 0;
-    nvs_iterator_t it = NULL;
-    esp_err_t err = nvs_entry_find(FIDO_NVS_PARTITION, FIDO_NVS_NAMESPACE,
-                                   NVS_TYPE_ANY, &it);
-    while (err == ESP_OK && it && count < max_rps) {
-        nvs_entry_info_t info;
-        nvs_entry_info(it, &info);
-        if (strncmp(info.key, "u_", 2) == 0 && info.key[2] != '\0') {
-            snprintf(rps[count], AUTH_FIDO_RP_KEY_MAX, "%.12s", info.key + 2);
-            count++;
-        }
-        err = nvs_entry_next(&it);
-    }
-    nvs_release_iterator(it);
-    nvs_close(handle);
-    return count;
+    return auth_fido_list(rps, max_rps);
 }
 
-bool auth_storage_fido_delete(const char *rp_key)
+bool auth_storage_fido_delete(const char *rp_id)
 {
-    if (!rp_key || rp_key[0] == '\0') return false;
-
-    nvs_handle_t handle;
-    if (nvs_open(FIDO_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
-        return false;
-    }
-
-    char key[16];
-    snprintf(key, sizeof(key), "u_%.12s", rp_key);
-    nvs_erase_key(handle, key);
-    snprintf(key, sizeof(key), "s_%.12s", rp_key);
-    nvs_erase_key(handle, key);
-    esp_err_t err = nvs_commit(handle);
-    nvs_close(handle);
-    return err == ESP_OK;
+    return auth_fido_delete(rp_id);
 }
 
 bool auth_storage_fido_reset_all(void)
@@ -523,7 +487,7 @@ bool auth_storage_fido_reset_all(void)
 
 #else
 
-uint8_t auth_storage_fido_list(char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_t max_rps)
+uint8_t auth_storage_fido_list(auth_fido_site_t *rps, uint8_t max_rps)
 {
     (void)rps;
     (void)max_rps;

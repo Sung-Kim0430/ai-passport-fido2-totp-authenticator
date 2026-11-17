@@ -5,6 +5,7 @@
 #include "auth_wifi.h"
 #include "totp_crypto.h"
 #include "rtc_clock.h"
+#include "auth_time_sync.h"
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -89,11 +90,13 @@ typedef struct {
 static time_probe_t s_time_probes[4];
 static uint32_t s_time_probe_counter;
 static uint32_t s_time_probe_nonce;
+static auth_time_sync_cache_t s_precise_time_probes;
 
 static void time_probe_new_session(void)
 {
     memset(s_time_probes, 0, sizeof(s_time_probes));
     s_time_probe_nonce = esp_random();
+    auth_time_sync_reset(&s_precise_time_probes, esp_random());
 }
 
 static time_probe_t time_probe_record(int64_t hrt_us, int64_t window_us, bool ordered)
@@ -468,6 +471,32 @@ static esp_err_t status_handler(httpd_req_t *req)
     return httpd_resp_send(req, buf, len);
 }
 
+/* Handler-entry/response timestamps include transport scheduling uncertainty. */
+static esp_err_t time_probe_handler(httpd_req_t *req)
+{
+    const int64_t received = esp_timer_get_time();
+    char token[33];
+    if (httpd_req_get_hdr_value_str(req, "X-Passport-Session", token, sizeof(token)) != ESP_OK || strlen(token) != 32)
+        return error_response(req, "403 Forbidden", "Refresh the device page");
+    unsigned difference = 0;
+    for (size_t i = 0; i < 32; ++i) difference |= (unsigned char)token[i] ^ (unsigned char)s_session[i];
+    if (difference) return error_response(req, "403 Forbidden", "Refresh the device page");
+    portENTER_CRITICAL(&s_snapshot_lock);
+    const bool unlocked = s_snapshot.unlocked;
+    portEXIT_CRITICAL(&s_snapshot_lock);
+    if (!unlocked) return error_response(req, "423 Locked", "Unlock the device first");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_type(req, "application/json");
+    const int64_t sent = esp_timer_get_time();
+    const auth_time_sync_probe_t p = auth_time_sync_record(&s_precise_time_probes, received, sent);
+    char response[192];
+    const int n = snprintf(response, sizeof response,
+        "{\"version\":2,\"id\":%lu,\"received_us\":%lld,\"sent_us\":%lld,\"valid\":%s}",
+        (unsigned long)p.id, (long long)p.received_us, (long long)p.sent_us, p.valid ? "true" : "false");
+    if (n < 0 || (size_t)n >= sizeof response) return httpd_resp_send_500(req);
+    return httpd_resp_send(req, response, n);
+}
+
 static size_t json_escape(const char *src, char *dst, size_t capacity)
 {
     size_t n = 0;
@@ -560,6 +589,29 @@ static void parse_time_reference(const cJSON *json, fido_parsed_cmd_t *cmd)
     cmd->time_reference_uncertainty_us = 1000000 + (rtt_us + 1) / 2 + ((uint64_t)probe->window_us + 1) / 2;
 }
 
+static bool parse_precise_time_reference(const cJSON *json, fido_parsed_cmd_t *cmd)
+{
+    uint64_t version, id, utc_us, rtt_us, spread_us;
+    if (!number_field(json, "reference_version", 2, &version) || version != 2 ||
+        !number_field(json, "reference_probe_id", UINT32_MAX, &id) || !id ||
+        !number_field(json, "reference_utc_us", UINT64_C(4102444800000000), &utc_us) ||
+        !number_field(json, "reference_rtt_us", 500000, &rtt_us) ||
+        !number_field(json, "reference_spread_us", 20000, &spread_us)) return false;
+    auth_time_sync_reference_t r;
+    if (!auth_time_sync_resolve(&s_precise_time_probes, (uint32_t)id, utc_us, rtt_us,
+            spread_us, esp_timer_get_time(), &r)) return false;
+    cmd->time_reference_present = true;
+    cmd->time_reference_quality = true;
+    cmd->time_reference_precise = true;
+    cmd->time_reference_id = r.reference_id;
+    cmd->time_reference_utc_us = r.utc_us;
+    cmd->time_reference_hrt_us = r.hrt_us;
+    cmd->time_reference_phone_uncertainty_us = r.phone_uncertainty_us;
+    cmd->time_reference_transport_uncertainty_us = r.transport_uncertainty_us;
+    cmd->time_reference_uncertainty_us = r.phone_uncertainty_us + r.transport_uncertainty_us;
+    return true;
+}
+
 static bool parse_command_json(const cJSON *json, fido_parsed_cmd_t *cmd)
 {
     char name[32];
@@ -599,6 +651,8 @@ static bool parse_command_json(const cJSON *json, fido_parsed_cmd_t *cmd)
     if (!strcmp(name, "SYNC_TIME")) {
         cmd->type = FIDO_CMD_SYNC_TIME;
         if (!number_field(json, "value", 4102444800ULL, &cmd->num_param)) return false;
+        if (cJSON_GetObjectItemCaseSensitive(json, "reference_version"))
+            return parse_precise_time_reference(json, cmd);
         parse_time_reference(json, cmd);
         return true;
     }
@@ -671,7 +725,8 @@ static esp_err_t command_handler(httpd_req_t *req)
     cmd.request_id = s_request_id;
     if (cmd.type == FIDO_CMD_SYNC_TIME && cmd.time_reference_present) {
         uint32_t probe_id = (uint32_t)cmd.time_reference_id;
-        s_time_probes[(probe_id - 1) % 4].valid = false;
+        if (cmd.time_reference_precise) (void)auth_time_sync_consume(&s_precise_time_probes, probe_id);
+        else s_time_probes[(probe_id - 1) % 4].valid = false;
     }
     bool queued = s_cmd_cb && s_cmd_cb(&cmd);
     uint32_t id = cmd.request_id;
@@ -765,6 +820,7 @@ bool auth_wifi_ap_stop(void)
     }
     memset(s_session, 0, sizeof(s_session));
     memset(s_time_probes, 0, sizeof(s_time_probes));
+    auth_time_sync_reset(&s_precise_time_probes, 0);
     s_cmd_cb = NULL;
     return true;
 }
@@ -815,7 +871,7 @@ bool auth_wifi_ap_start(auth_config_t *cfg, auth_wifi_cmd_cb_t callback)
     httpd_config_t http = HTTPD_DEFAULT_CONFIG();
     http.stack_size = 6144;
     http.max_open_sockets = 2;
-    http.max_uri_handlers = 8;
+    http.max_uri_handlers = 9;
     http.backlog_conn = 2;
     http.lru_purge_enable = true;
     http.recv_wait_timeout = 3;
@@ -826,6 +882,7 @@ bool auth_wifi_ap_start(auth_config_t *cfg, auth_wifi_cmd_cb_t callback)
         {.uri = "/", .method = HTTP_GET, .handler = index_handler},
         {.uri = "/index.html", .method = HTTP_GET, .handler = index_handler},
         {.uri = "/api/status", .method = HTTP_GET, .handler = status_handler},
+        {.uri = "/api/time-probe", .method = HTTP_GET, .handler = time_probe_handler},
         {.uri = "/api/rtc-history", .method = HTTP_GET, .handler = history_handler},
         {.uri = "/api/accounts", .method = HTTP_GET, .handler = accounts_handler},
         {.uri = "/api/command", .method = HTTP_POST, .handler = command_handler},

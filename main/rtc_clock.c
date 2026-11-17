@@ -1000,7 +1000,8 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
     if (reference->hrt_us < 0 || now < reference->hrt_us || reference->utc_us < minimum ||
         reference->utc_us > maximum) return RTC_CLOCK_REFERENCE_FAILED;
     const uint64_t age = (uint64_t)(now - reference->hrt_us);
-    if (age > maximum - reference->utc_us) return RTC_CLOCK_REFERENCE_FAILED;
+    if (age > maximum - reference->utc_us ||
+        (reference->max_age_us && age > reference->max_age_us)) return RTC_CLOCK_REFERENCE_FAILED;
     rtc_clock_accounting_t next = rtc_clock_retained.accounting;
     rtc_history_record_t history_row;
     bool capture_history = false;
@@ -1029,7 +1030,8 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
         }
     }
     const int64_t before = rtc_clock_platform_uptime_us();
-    if (before < now || (uint64_t)(before - reference->hrt_us) > maximum - reference->utc_us)
+    if (before < now || (uint64_t)(before - reference->hrt_us) > maximum - reference->utc_us ||
+        (reference->max_age_us && (uint64_t)(before - reference->hrt_us) > reference->max_age_us))
         return RTC_CLOCK_REFERENCE_FAILED;
     const int64_t target = (int64_t)(reference->utc_us + (uint64_t)(before - reference->hrt_us));
     if (!rtc_clock_platform_set_wall_us(target)) return RTC_CLOCK_REFERENCE_FAILED;

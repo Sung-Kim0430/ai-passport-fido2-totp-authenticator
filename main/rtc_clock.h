@@ -40,6 +40,7 @@ typedef struct {
     uint64_t uncertainty_us;
     int64_t hrt_us;
     bool quality;
+    uint32_t max_age_us; /* Zero preserves the legacy set-but-do-not-train policy. */
 } rtc_clock_reference_t;
 
 typedef enum {

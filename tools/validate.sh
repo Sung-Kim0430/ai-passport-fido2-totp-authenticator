@@ -67,6 +67,7 @@ run_static_checks() (
     python3 tools/check_repo.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_sdk_version_contract.py
     python3 tools/embed_web_page.py --check
+    node tests/test_web_companion.js
     python3 tools/check_glyphs.py
 
     actionlint_bin="$(resolve_actionlint)"
@@ -89,6 +90,9 @@ run_static_checks() (
         -o "${test_dir}/test_auth_identity"
     "${test_dir}/test_auth_identity"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_auth_time_sync.c -o "${test_dir}/test_auth_time_sync"
+    "${test_dir}/test_auth_time_sync"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_auth_ui.c main/auth_ui.c \
         -o "${test_dir}/test_auth_ui"
     "${test_dir}/test_auth_ui"
@@ -104,6 +108,11 @@ run_static_checks() (
         tests/test_fido_protocol.c main/fido_protocol.c \
         -o "${test_dir}/test_fido_protocol"
     "${test_dir}/test_fido_protocol"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_auth_fido_store.c main/auth_fido_store.c main/fido_protocol.c main/totp_crypto.c main/totp_sha2.c \
+        -o "${test_dir}/test_auth_fido_store"
+    "${test_dir}/test_auth_fido_store"
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_fido_storage_platform.py
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_ui_pixel_math.c main/ui_pixel_math.c \
         -o "${test_dir}/test_ui_pixel_math"
@@ -174,6 +183,7 @@ run_static_checks() (
             -o "${test_dir}/test_demo_${demo}_runtime"
         "${test_dir}/test_demo_${demo}_runtime"
     done
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_ble_material.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_auth_lifecycle.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_profile.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_poll.py

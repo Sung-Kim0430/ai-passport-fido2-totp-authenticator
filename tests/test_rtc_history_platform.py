@@ -66,7 +66,7 @@ assert(io.read(io.user,"c0",p,&n)==RTC_HISTORY_STORE_IO_ERROR);
 assert(!live && opens==closes); return 0;
 }
 '''
-        with tempfile.TemporaryDirectory(dir=os.environ['COMMANDCODE_SCRATCHPAD']) as d:
+        with tempfile.TemporaryDirectory(dir=os.environ.get('COMMANDCODE_SCRATCHPAD')) as d:
             p = Path(d)
             (p / 'test.c').write_text(code)
             subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Imain', str(p / 'test.c'), '-o', str(p / 'test')], cwd=ROOT, check=True)

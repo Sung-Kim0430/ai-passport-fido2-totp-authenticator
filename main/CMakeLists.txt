@@ -13,6 +13,8 @@ idf_component_register(
          "fido_protocol.c"
          "fido_pin.c"
          "auth_storage.c"
+         "auth_fido_store.c"
+         "auth_fido_store_platform.c"
          "auth_identity.c"
          "auth_ble.c"
          "auth_ui.c"

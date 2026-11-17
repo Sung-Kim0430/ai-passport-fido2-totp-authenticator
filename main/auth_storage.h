@@ -2,6 +2,7 @@
 #define AUTH_STORAGE_H
 
 #include <stdbool.h>
+#include "auth_fido_store.h"
 #include <stdint.h>
 #include "rtc_clock.h"
 
@@ -82,12 +83,12 @@ bool auth_set_current_timestamp(auth_config_t *cfg, uint64_t unix_ts);
 bool auth_set_reference_timestamp(auth_config_t *cfg, const rtc_clock_reference_t *reference);
 
 #define AUTH_MAX_FIDO_RPS 8
-#define AUTH_FIDO_RP_KEY_MAX 16
+#define AUTH_FIDO_RP_KEY_MAX AUTH_FIDO_RP_MAX
 
 // 当前实验凭据模型以 RP 键为单位；不在显示列表中暴露主密钥或盐值。
 bool auth_storage_lab_load(auth_lab_config_t *lab);
 bool auth_storage_lab_save(const auth_lab_config_t *lab);
-uint8_t auth_storage_fido_list(char rps[][AUTH_FIDO_RP_KEY_MAX], uint8_t max_rps);
+uint8_t auth_storage_fido_list(auth_fido_site_t *rps, uint8_t max_rps);
 bool auth_storage_fido_delete(const char *rp_id_key);
 bool auth_storage_fido_reset_all(void);
 

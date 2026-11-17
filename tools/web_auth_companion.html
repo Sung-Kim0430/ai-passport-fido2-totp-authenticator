@@ -19,7 +19,7 @@
 <div class="tools"><input id="search" type="search" aria-label="搜索服务商或账号" placeholder="搜索服务商或账号"><button type="button" id="refresh">刷新账号</button></div><div class="panel" id="accountList"><div class="empty">连接并解锁设备后查看账号</div></div>
 <details class="panel" id="accountEditor"><summary id="editorTitle">添加令牌</summary><form id="accountForm"><fieldset id="accountFields" disabled><div class="form-grid"><div><label for="issuer">服务商</label><input id="issuer" maxlength="31" required autocomplete="off"></div><div><label for="account">账号名称</label><input id="account" maxlength="31" required autocomplete="off"></div><div><label for="algorithm">算法 / 类型</label><select id="algorithm"><option value="0">TOTP · SHA-1</option><option value="1">TOTP · SHA-256</option><option value="2">TOTP · SHA-512</option><option value="3">Steam Guard</option></select></div><div><label for="digits">验证码位数</label><select id="digits"><option value="6">6 位</option><option value="8">8 位</option><option value="5" hidden>Steam 5 字符</option></select></div><div><label for="period">刷新周期（秒）</label><input id="period" type="number" min="1" max="255" value="30" required></div><div><label for="encoding">密钥编码</label><select id="encoding"><option value="base32">Base32</option><option value="base64">Steam shared_secret · Base64</option></select></div><div class="full"><label for="secret">密钥 <span id="secretHint" class="muted">（仅在添加或更换时填写）</span></label><input id="secret" type="password" autocomplete="new-password" spellcheck="false" maxlength="256"><p class="hint">编辑时留空保留原密钥。Steam 使用你已合法持有的 shared_secret；不需要密码、登录 cookie 或 identity_secret。</p></div></div><div class="row"><button class="primary" id="saveAccount" type="submit">保存令牌</button><button id="cancelEdit" type="button">取消编辑</button></div></fieldset></form></details>
 <details class="panel"><summary>导入 otpauth URI</summary><form id="importForm"><fieldset id="importFields" disabled><label for="uris">每行一条 otpauth://totp/ 链接</label><textarea id="uris" spellcheck="false" autocomplete="off" placeholder="粘贴已有的 otpauth URI，不会上传到第三方"></textarea><p class="hint">支持 SHA1 / SHA256 / SHA512、位数与周期参数。Steam 链接可带 encoder=steam。导入逐条保存，遇错停止并报告已保存数量。</p><button type="submit" class="primary">校验并导入</button></fieldset></form></details></section>
-<section id="page-device" aria-labelledby="deviceTitle" hidden><h2 id="deviceTitle">设备</h2><div class="panel"><h3>时间校准</h3><dl><dt>浏览器时间</dt><dd id="browserTime">--</dd><dt>设备时间</dt><dd id="deviceTime">--</dd><dt>时间偏差</dt><dd id="drift">--</dd></dl><p class="hint">完全断电后请重新校时。时区只影响显示，不改变 TOTP 的 UTC 时间窗口。</p><button type="button" class="primary" id="syncTime" data-control>同步当前时间</button></div><div class="panel"><h3>显示与声音</h3><fieldset id="deviceFields" disabled><label for="brightness">亮度 <output id="brightnessValue">80%</output></label><input id="brightness" type="range" min="10" max="100" value="80"><label class="row" for="sound"><input id="sound" type="checkbox">按键声音</label></fieldset></div><div class="panel"><h3>设备状态</h3><dl><dt>芯片标识</dt><dd id="deviceId">--</dd><dt>热点名称</dt><dd id="ssid">--</dd><dt>空闲内部堆</dt><dd id="heap">--</dd><dt>最大连续块</dt><dd id="largest">--</dd></dl><p class="hint">热点密码由芯片标识派生，后四位包含在 SSID 中。这是便捷配网方案，不应当作高强度身份认证。</p></div><div class="panel"><h3>危险操作</h3><p class="hint">清空会删除设备上的 TOTP 与 FIDO 凭据，不能撤销。网页只发起请求，仍需在设备上按 OK 确认。</p><button type="button" class="danger" id="wipe" data-control>请求清空全部令牌</button></div></section>
+<section id="page-device" aria-labelledby="deviceTitle" hidden><h2 id="deviceTitle">设备</h2><div class="panel"><h3>时间校准</h3><dl><dt>浏览器时间</dt><dd id="browserTime">--</dd><dt>设备时间</dt><dd id="deviceTime">--</dd><dt>时间偏差</dt><dd id="drift">--</dd></dl><p class="hint">每次同步会测量多轮延迟，采用较稳定的样本；请保持页面在前台。手机自身时间需准确，完全断电后请重新校时。时区只影响显示。</p><button type="button" class="primary" id="syncTime" data-control>同步当前时间</button></div><div class="panel"><h3>显示与声音</h3><fieldset id="deviceFields" disabled><label for="brightness">亮度 <output id="brightnessValue">80%</output></label><input id="brightness" type="range" min="10" max="100" value="80"><label class="row" for="sound"><input id="sound" type="checkbox">按键声音</label></fieldset></div><div class="panel"><h3>设备状态</h3><dl><dt>芯片标识</dt><dd id="deviceId">--</dd><dt>热点名称</dt><dd id="ssid">--</dd><dt>空闲内部堆</dt><dd id="heap">--</dd><dt>最大连续块</dt><dd id="largest">--</dd></dl><p class="hint">热点密码由芯片标识派生，后四位包含在 SSID 中。这是便捷配网方案，不应当作高强度身份认证。</p></div><div class="panel"><h3>危险操作</h3><p class="hint">清空会删除设备上的 TOTP 与 FIDO 凭据，不能撤销。网页只发起请求，仍需在设备上按 OK 确认。</p><button type="button" class="danger" id="wipe" data-control>请求清空全部令牌</button></div></section>
 <section id="page-lab" aria-labelledby="labTitle" hidden><h2 id="labTitle">实验室</h2><div class="panel"><h3>RTC 校准历史</h3><p class="hint">只读诊断；影子估计 READY 不代表启用。温度为清醒端点，电池电压不代表 USB 供电。刷新仅显示前 5 行；导出最多 100 行，历史变化或请求失败时不会下载部分结果。</p><div class="row"><button type="button" id="rtcRefresh" data-control>查看 / 刷新</button><button type="button" id="rtcExport" data-control>导出校准 JSON</button></div><p id="rtcSummary" role="status">解锁后手动刷新；不会自动校时或轮询历史。</p><pre id="rtcRows" style="overflow:auto;max-height:320px"></pre></div><div class="panel"><h3>BLE FIDO</h3><p>从设备的 Settings → Lab / Experiments 开启，默认关闭。Wi-Fi 热点运行时 BLE 暂停，以控制内部 RAM 使用。</p><p class="hint">BLE FIDO 尚未完成手机注册 / 登录端到端验收，不能视为已认证安全密钥。此页不将普通确认提示冒充 WebAuthn 注册成功。</p></div><div class="panel"><h3>调试边界</h3><p class="hint">USB Log Console 仅切换应用日志，不关闭硬件 JTAG。本固件不烧写 OTP/eFuse，也不启用不可逆保护。ESP32-C3 的固定 USB Serial/JTAG 不能提供原生 USB HID FIDO2。</p></div></section>
 <footer>仅连接本机管理，不依赖云服务或 CDN。请保留各服务的恢复码；当前固件不是安全芯片或认证过的商业安全密钥。</footer>
 </main>
@@ -36,11 +36,22 @@ function controls() {
   const steam = $('algorithm').value === '3';
   $('digits').disabled = !enabled || steam; $('period').disabled = !enabled || steam;
 }
-async function request(path, options) {
-  const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(5000) : undefined;
-  const response = await fetch(path, {cache: 'no-store', signal, ...options});
-  if (!response.ok) throw new Error(await response.text() || `请求失败 (${response.status})`);
-  return response.json();
+async function request(path, options, timeoutMs = 5000) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  let timer;
+  const deadline = new Promise((_,reject) => {
+    timer = setTimeout(() => { controller?.abort(); reject(new Error('请求超时，请重试')); }, timeoutMs);
+  });
+  try {
+    return await Promise.race([(async () => {
+      const response = await fetch(path, {cache:'no-store', ...options, signal:controller?.signal});
+      if (!response.ok) {
+        const error = new Error(await response.text() || `请求失败 (${response.status})`);
+        error.status = response.status; throw error;
+      }
+      return response.json();
+    })(),deadline]);
+  } finally { clearTimeout(timer); }
 }
 async function updateStatus() {
   status = await request('/api/status'); connected = true;
@@ -81,20 +92,21 @@ function renderAccounts() {
     actions.append(edit, remove); row.append(names, actions); list.append(row);
   }
 }
-async function sendCommand(payload) {
-  if (busy || !connected || !status?.unlocked) throw new Error('请先连接并在设备上解锁');
+async function sendCommand(payload, alreadyBusy = false) {
+  if ((busy && !alreadyBusy) || !connected || !status?.unlocked) throw new Error('请先连接并在设备上解锁');
   busy = true; controls(); renderAccounts();
   try {
     const result = await request('/api/command', {method:'POST', headers:{'Content-Type':'application/json','X-Passport-Session':status.session}, body:JSON.stringify({...payload,revision:payload.revision ?? accountRevision})});
-    const deadline = Date.now() + 6000;
-    while (Date.now() < deadline) {
+    const now = typeof performance !== 'undefined' && typeof performance.now === 'function' ? () => performance.now() : () => Date.now();
+    const deadline = now() + 6000;
+    while (now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 200));
       const current = await updateStatus();
       const done = current.results.find(r => r.id === result.id);
       if (done) { if (!done.ok) throw new Error('设备未保存操作，可能已锁定、存储失败或参数不适用；请刷新检查'); await loadAccounts(); return; }
     }
     throw new Error('操作结果未确认，请刷新检查，不要连续重复提交');
-  } finally { busy = false; controls(); renderAccounts(); }
+  } finally { if (!alreadyBusy) { busy = false; controls(); renderAccounts(); } }
 }
 function resetEditor() { editing = null; $('accountForm').reset(); $('editorTitle').textContent = '添加令牌'; $('secret').value = ''; applyAlgorithm(false); }
 function editAccount(a) {
@@ -236,34 +248,80 @@ async function rtcHistoryAction(download) {
 }
 $('rtcRefresh').addEventListener('click', () => rtcHistoryAction(false));
 $('rtcExport').addEventListener('click', () => rtcHistoryAction(true));
+function timeSyncSample({probe,wallBeforeMs,wallAfterMs,monoBeforeMs,monoAfterMs}) {
+  const rttMs = monoAfterMs - monoBeforeMs;
+  if (![wallBeforeMs,wallAfterMs,monoBeforeMs,monoAfterMs,rttMs].every(Number.isFinite) || rttMs <= 0 || rttMs > 500) return null;
+  if (Math.abs(wallAfterMs - wallBeforeMs - rttMs) > 5) throw new Error('手机时间发生变化，请稳定后重新校时');
+  if (!probe || probe.version !== 2 || probe.valid !== true ||
+      !Number.isInteger(probe.id) || probe.id <= 0 || probe.id > 0xffffffff ||
+      !Number.isSafeInteger(probe.received_us) || probe.received_us < 0 ||
+      !Number.isSafeInteger(probe.sent_us) || probe.sent_us < probe.received_us) return null;
+  const processingUs = probe.sent_us - probe.received_us;
+  const rttUs = Math.ceil(rttMs * 1000);
+  if (processingUs > rttMs * 1000 || processingUs > 500000) return null;
+  const anchorUs = probe.received_us + Math.floor(processingUs / 2);
+  const offsetUs = wallBeforeMs * 1000 + rttMs * 500 - anchorUs;
+  if (!Number.isFinite(offsetUs) || wallBeforeMs < 1577836800000 || wallAfterMs > 4102444800000) return null;
+  return {probe,anchorUs,offsetUs,rttUs,networkUs:rttUs-processingUs,monoAfterMs};
+}
+function selectTimeSyncReference(samples) {
+  if (samples.length < 6) throw new Error('有效校时样本不足，请保持页面在前台后重试');
+  const group = samples.map((s,index)=>({...s,index})).sort((a,b)=>a.networkUs-b.networkUs || a.index-b.index)
+    .slice(0,Math.min(5,Math.max(3,Math.ceil(samples.length/3))));
+  const offsets = group.map(s=>s.offsetUs).sort((a,b)=>a-b);
+  const center = Math.floor(offsets.length/2);
+  const medianUs = offsets.length%2 ? offsets[center] : (offsets[center-1]+offsets[center])/2;
+  const spreadUs = Math.ceil(Math.max(...offsets.map(value=>Math.abs(value-medianUs))));
+  if (spreadUs > 20000) throw new Error('校时样本不稳定，请靠近设备后重试');
+  const anchor = group.reduce((a,b)=>a.index>b.index?a:b);
+  const utcUs = Math.round(anchor.anchorUs+medianUs);
+  if (!Number.isSafeInteger(utcUs) || utcUs < 1577836800000000 || utcUs > 4102444800000000) throw new Error('手机时间超出支持范围');
+  return {payload:{command:'SYNC_TIME',value:Math.floor(utcUs/1000000),reference_version:2,
+    reference_probe_id:anchor.probe.id,reference_utc_us:utcUs,
+    reference_rtt_us:anchor.rttUs,reference_spread_us:spreadUs},
+    transportUs:Math.ceil(anchor.networkUs/2)+1000+spreadUs,
+    networkUs:anchor.networkUs,samples:samples.length};
+}
 async function syncBrowserTime() {
+  let ownsBusy = false;
   try {
     if (busy || !connected || !status?.unlocked) throw new Error('请先连接并在设备上解锁');
-    const wallBeforeMs = Date.now();
-    const monotonic = typeof performance !== 'undefined' && typeof performance.now === 'function';
-    const monoBeforeMs = monotonic ? performance.now() : NaN;
-    let fresh;
-    try { fresh = await request('/api/status'); } catch {}
-    const monoAfterMs = monotonic ? performance.now() : NaN;
-    const wallAfterMs = Date.now();
-    const rttMs = monoAfterMs - monoBeforeMs;
-    const deltaMs = wallAfterMs - wallBeforeMs;
-    const probe = fresh?.time_probe;
-    const referenceUtcUs = Math.round((wallBeforeMs + wallAfterMs) * 500);
-    const eligible = !!probe && probe.valid === true &&
-      Number.isInteger(probe.id) && probe.id > 0 && probe.id <= 0xffffffff &&
-      Number.isSafeInteger(probe.hrt_us) && probe.hrt_us >= 0 &&
-      Number.isInteger(probe.window_us) && probe.window_us >= 0 && probe.window_us <= 1000 &&
-      Number.isFinite(rttMs) && rttMs > 0 && rttMs <= 2000 &&
-      Number.isFinite(deltaMs) && Math.abs(deltaMs - rttMs) <= 100 &&
-      Number.isSafeInteger(referenceUtcUs) && referenceUtcUs >= 1577836800000000 && referenceUtcUs <= 4102444800000000;
-    if (fresh) status = fresh;
-    await sendCommand({command:'SYNC_TIME',value:Math.floor(Date.now()/1000),...(eligible ? {
-      reference_probe_id:probe.id,reference_utc_us:referenceUtcUs,
-      reference_rtt_us:Math.ceil(rttMs * 1000),reference_clock_delta_us:Math.round(deltaMs * 1000)
-    } : {})});
-    message(eligible ? '时间同步已发送，参考样本可供设备评估；不保证校准系数已合格' : '时间同步已发送；未提供合格参考样本，仅按秒同步');
+    if (typeof performance === 'undefined' || typeof performance.now !== 'function') throw new Error('浏览器不支持精确计时，请换用现代浏览器');
+    const session = status.session, device = status.device_id;
+    const checkSession = current => {
+      if (!current?.unlocked || !connected || current.session !== session || current.device_id !== device)
+        throw new Error('设备已锁定或连接已变化，请刷新后重试');
+    };
+    busy = true; ownsBusy = true; controls(); renderAccounts();
+    const fresh = await request('/api/status'); checkSession(fresh); status = fresh;
+    const startWall = Date.now(), startMono = performance.now();
+    const samples = [];
+    const checkClock = () => {
+      if (document.hidden) throw new Error('请保持页面在前台，然后重新校时');
+      if (Math.abs(Date.now()-startWall-(performance.now()-startMono)) > 5)
+        throw new Error('手机时间发生变化，请稳定后重新校时');
+    };
+    for (let i=0;i<12;i++) {
+      checkSession(status); checkClock();
+      const remainingMs = 3000-(performance.now()-startMono);
+      if (remainingMs <= 0) break;
+      message(`正在测量校时延迟 ${i+1}/12，请保持页面在前台`);
+      const wallBeforeMs = Date.now(), monoBeforeMs = performance.now();
+      let probe;
+      try { probe = await request('/api/time-probe', {headers:{'X-Passport-Session':session}}, Math.min(500,remainingMs)); }
+      catch (error) { if (error.status === 403 || error.status === 423) throw error; continue; }
+      const monoAfterMs = performance.now(), wallAfterMs = Date.now();
+      checkSession(status); checkClock();
+      const sample = timeSyncSample({probe,wallBeforeMs,wallAfterMs,monoBeforeMs,monoAfterMs});
+      if (sample) samples.push(sample);
+    }
+    checkSession(status); checkClock();
+    const selected = selectTimeSyncReference(samples);
+    // Submit once. The owner advances this cached anchor to its actual execution time.
+    await sendCommand(selected.payload, true);
+    message(`时间同步已完成（${selected.samples} 组有效采样）；传输误差估计 ±${(selected.transportUs/1000).toFixed(1)} ms。手机自身时间仍按 ±1 秒界限计入，不代表已验证绝对精度。`);
   } catch(e) { message(e.message,true); }
+  finally { if (ownsBusy) { busy = false; controls(); renderAccounts(); } }
 }
 $('syncTime').addEventListener('click', syncBrowserTime);
 $('brightness').addEventListener('input', e => $('brightnessValue').textContent = `${e.target.value}%`);

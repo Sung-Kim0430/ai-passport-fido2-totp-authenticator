@@ -85,6 +85,103 @@ static void test_command_parser(void)
     printf("FIDO command parser: PASS\n");
 }
 
+static void test_invalid_commands_do_not_mutate_accounts(void)
+{
+    const char *invalid[] = {
+        "DEL_TOTP", "DEL_TOTP junk", "DEL_TOTP -1", "DEL_TOTP +0",
+        "DEL_TOTP 0junk", "DEL_TOTP 0 1", "DEL_TOTP 18446744073709551616",
+        "SYNC_TIME", "SYNC_TIME 1.5", "SET_BRIGHTNESS -10", "SET_SOUND garbage",
+        "SET_SOUND 2", "WIPE_ALL extra", "CANCEL extra", "ADD_TOTP a b",
+        "AUTH_REQ", "REG_REQ a b c extra"
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+        assert(fido_parse_command(invalid[i]).type == FIDO_CMD_INVALID);
+    assert(fido_parse_command("DEL_TOTP 0 \t\r\n").type == FIDO_CMD_DEL_TOTP);
+    assert(fido_parse_command("DEL_TOTP 18446744073709551615").num_param == UINT64_MAX);
+    char oversized[300];
+    memset(oversized, ' ', sizeof(oversized));
+    memcpy(oversized, "WIPE_ALL", 8);
+    oversized[sizeof(oversized) - 1] = 0;
+    assert(fido_parse_command(oversized).type == FIDO_CMD_INVALID);
+    puts("Invalid text commands cannot become account mutations: PASS");
+}
+
+static void test_cbor_container_and_identity_bounds(void)
+{
+    uint8_t request[160] = {0x02, 0xa2, 0x01, 0x61, 'a', 0x02, 0x58, 0x20};
+    char rp[64];
+    uint8_t hash[32], allow[64];
+    size_t allow_len;
+    fido_auth_params_t auth;
+    assert(ctap2_parse_get_assertion(request, 40, rp, sizeof(rp), hash, allow, &allow_len, &auth));
+    request[1] = 0xa3; /* Missing declared pair. */
+    assert(!ctap2_parse_get_assertion(request, 40, rp, sizeof(rp), hash, allow, &allow_len, &auth));
+    request[1] = 0xa2; request[40] = 0;
+    assert(!ctap2_parse_get_assertion(request, 41, rp, sizeof(rp), hash, allow, &allow_len, &auth));
+    /* An RP ID must retain its full identity, including embedded zero bytes. */
+    request[3] = 0x78; request[4] = 68;
+    memset(request + 5, 'a', 68);
+    request[73] = 0x02; request[74] = 0x58; request[75] = 0x20;
+    memset(request + 76, 0, 32);
+    assert(!ctap2_parse_get_assertion(request, 108, rp, sizeof(rp), hash, allow, &allow_len, &auth));
+    uint8_t nul_rp[41] = {0x02, 0xa2, 0x01, 0x62, 'a', 0, 0x02, 0x58, 0x20};
+    assert(!ctap2_parse_get_assertion(nul_rp, sizeof(nul_rp), rp, sizeof(rp), hash, allow, &allow_len, &auth));
+    puts("CBOR containers and RP identity bounds: PASS");
+}
+
+static void test_display_labels_may_be_shortened(void)
+{
+    uint8_t request[160] = {0x01,0xa3,1,0x58,0x20};
+    size_t n=37;
+    const uint8_t rp[] = {2,0xa1,0x62,'i','d',0x61,'a'};
+    const uint8_t user[] = {3,0xa2,0x62,'i','d',0x41,1,0x64,'n','a','m','e',0x78,64};
+    memcpy(request+n,rp,sizeof(rp));n+=sizeof(rp);
+    memcpy(request+n,user,sizeof(user));n+=sizeof(user);
+    memset(request+n,'u',64);n+=64;
+    char rpid[64], name[64]; uint8_t hash[32],id[64];size_t id_len;fido_auth_params_t auth;
+    assert(ctap2_parse_make_credential(request,n,rpid,sizeof(rpid),hash,name,sizeof(name),id,&id_len,&auth));
+    assert(strlen(name)==63 && id_len==1 && id[0]==1);
+    /* Three-byte UTF-8 labels cannot end in a partial character. */
+    for(size_t i=0;i<63;i+=3) memcpy(request+n-64+i,"\xe6\x97\xb6",3);
+    request[n-1]='u';
+    char short_name[63];
+    assert(ctap2_parse_make_credential(request,n,rpid,sizeof(rpid),hash,short_name,sizeof(short_name),id,&id_len,&auth));
+    assert(strlen(short_name)==60);
+    puts("Display-only labels preserve bounded UTF-8 truncation: PASS");
+}
+
+static void test_allow_list_matches_every_position(void)
+{
+    uint8_t list[] = {0x83,
+        0xa1,0x62,'i','d',0x44,1,2,3,4,
+        0xa1,0x62,'i','d',0x44,5,6,7,8,
+        0xa1,0x62,'i','d',0x44,9,10,11,12};
+    for (unsigned i = 0; i < 3; ++i) {
+        uint8_t id[] = {1+i*4,2+i*4,3+i*4,4+i*4};
+        assert(ctap2_allow_list_contains(list,sizeof(list),id,sizeof(id)));
+    }
+    uint8_t other[] = {13,14,15,16};
+    assert(!ctap2_allow_list_contains(list,sizeof(list),other,sizeof(other)));
+    assert(!ctap2_allow_list_contains(list,sizeof(list)-1,list+6,4));
+    const uint8_t empty[] = {0x80};
+    assert(!ctap2_allow_list_contains(empty,sizeof(empty),other,sizeof(other)));
+    puts("Allow-list matches first, middle and last credentials: PASS");
+}
+
+static void test_response_buffer_bounds(void)
+{
+    uint8_t bytes[256] = {0}, out[1024];
+    memset(out, 0xa5, sizeof(out));
+    assert(!ctap2_build_make_credential_resp(bytes, bytes, bytes, 255,
+                                             bytes, bytes, 0, 0x41, out, sizeof(out)));
+    assert(!ctap2_build_get_assertion_resp(bytes, bytes, 255, 1, 0,
+                                           bytes, 255, bytes, 64, out, 256));
+    assert(out[256] == 0xa5);
+    assert(!ctap2_build_get_assertion_resp(bytes, bytes, 256, 1, 0,
+                                           bytes, 70, NULL, 0, out, sizeof(out)));
+    puts("Response builders reject overflowing buffers: PASS");
+}
+
 static void test_ctap2_cbor_parsers_and_builders(void)
 {
     /* Test 1: authenticatorMakeCredential request */
@@ -161,6 +258,19 @@ static void test_ctap2_cbor_parsers_and_builders(void)
     assert(auth.pin_uv_auth_param_len == 0);
     assert(!auth.uv_requested);
 
+    req_ga[1] = 0xa3;
+    req_ga[idx++] = 3;
+    const uint8_t list[] = {0x81,0xa1,0x62,'i','d',0x44,1,2,3,4};
+    memcpy(req_ga + idx,list,sizeof(list)); idx += sizeof(list);
+    assert(ctap2_parse_get_assertion(req_ga,idx,rpid,sizeof(rpid),cdh_out,allow_id,&allow_id_len,&auth));
+    assert(auth.allow_list_len == sizeof(list) && auth.allow_list >= req_ga &&
+           auth.allow_list + auth.allow_list_len == req_ga + idx);
+    uint8_t pending[sizeof(list)];
+    memcpy(pending,auth.allow_list,auth.allow_list_len);
+    req_ga[idx-1] = 99;
+    const uint8_t expected_id[] = {1,2,3,4};
+    assert(ctap2_allow_list_contains(pending,sizeof(pending),expected_id,sizeof(expected_id)));
+
     /* Test 3: authenticatorMakeCredential response builder */
     uint8_t rpid_hash[32];
     memset(rpid_hash, 0x42, 32);
@@ -228,6 +338,11 @@ static void test_rejects_oversized_hash_and_deep_cbor(void)
 
 int main(void)
 {
+    test_invalid_commands_do_not_mutate_accounts();
+    test_cbor_container_and_identity_bounds();
+    test_display_labels_may_be_shortened();
+    test_allow_list_matches_every_position();
+    test_response_buffer_bounds();
     test_rejects_oversized_hash_and_deep_cbor();
     test_fido_state_flow();
     test_command_parser();
