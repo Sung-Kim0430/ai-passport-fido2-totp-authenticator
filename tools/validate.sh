@@ -136,6 +136,9 @@ run_static_checks() (
         -o "${test_dir}/test_rtc_clock"
     "${test_dir}/test_rtc_clock"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_rtc_light_sleep.c -o "${test_dir}/test_rtc_light_sleep"
+    "${test_dir}/test_rtc_light_sleep"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_rtc_wake_policy.c -o "${test_dir}/test_rtc_wake_policy"
     "${test_dir}/test_rtc_wake_policy"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Icomponents/bsp/src \
@@ -178,6 +181,7 @@ run_static_checks() (
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_clock_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_clock_platform.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_light_sleep_platform.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_history_platform.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_http_status.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_history_http.py

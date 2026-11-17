@@ -106,7 +106,8 @@ static esp_err_t backlight_init(void) {
         .timer_num       = BSP_BL_LEDC_TIMER,
         .duty_resolution = BSP_BL_LEDC_RES,
         .freq_hz         = BSP_BL_LEDC_FREQ_HZ,
-        .clk_cfg         = LEDC_AUTO_CLK,
+        // RC_FAST continues during light sleep; APB/XTAL PWM would stop.
+        .clk_cfg         = LEDC_USE_RC_FAST_CLK,
     };
     esp_err_t e = ledc_timer_config(&t);
     if (e != ESP_OK) { ESP_LOGE(TAG, "ledc_timer_config 失败: %s", esp_err_to_name(e)); return e; }
@@ -118,6 +119,7 @@ static esp_err_t backlight_init(void) {
         .timer_sel  = BSP_BL_LEDC_TIMER,
         .duty       = 0,
         .hpoint     = 0,
+        .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,
     };
     e = ledc_channel_config(&ch);
     if (e != ESP_OK) {

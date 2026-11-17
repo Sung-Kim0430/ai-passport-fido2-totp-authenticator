@@ -206,6 +206,7 @@ LICENSE                  仓库许可证
 | [中文字体](/docs/development/engineering/lvgl-chinese-fonts.zh_CN.md) | 字形覆盖、控件字体选择，以及中文空白排查 |
 | [Wi-Fi 配网](/docs/development/engineering/wifi-provisioning.zh_CN.md) | 蓝牙配网实现参考与配套小程序 |
 | [RTC 校准设计与计划](/docs/assets/rtc-calibration-design.zh_CN.md) | 认证器温度学习、周期维护、唤醒竞态及验证边界 |
+| [自动浅睡眠设计](/docs/assets/light-sleep-design.zh_CN.md) · [实施计划](/docs/assets/light-sleep-plan.zh_CN.md) | 空闲睡眠、RTC 记账、背光保持与验证 |
 | [社区作品与经验](/docs/reference/README.zh_CN.md) | `docs/reference/<username>/` 下的应用档案和可复用知识 |
 | [参与贡献](/docs/contribution/README.zh_CN.md) | 文档、提交与 Pull Request 约定 |
 | [品牌素材](/docs/brand/README.zh_CN.md) | 产品视觉参考与[品牌说明](/docs/brand/brand-and-product.zh_CN.md) |

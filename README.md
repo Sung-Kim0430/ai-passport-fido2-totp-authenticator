@@ -97,14 +97,41 @@ synchronization again. Until then the device displays `SYNC TIME`, not OTP codes
 Synchronizing time does not write NVS.
 
 When USB is connected at boot and the application log console is enabled, the
-existing tick task emits up to six `CLOCK_COMPARE` / `MEMORY` samples, then stops this
+existing tick task emits up to six `CLOCK_COMPARE` / `MEMORY` / `LIGHT_SLEEP` samples, then stops this
 startup trace. It adds no monitor task or on-device history. `hrt_us` and `rtc_us`
 are elapsed microseconds from the same baseline; `diff_us` is RTC minus HRT.
 Relative drift is `diff_us / hrt_us × 1,000,000` ppm, or
 `ppm × 0.0864 × days` seconds. These awake samples do not establish deep-sleep
 accuracy; temperature changes and long-term extrapolation require separate board
 measurements. The SDK's high-resolution-clock specification is not this board's
-measured absolute UTC accuracy.
+measured absolute UTC accuracy. If `LIGHT_SLEEP` counts advance during a sample,
+HRT includes RTC-reconstructed intervals and is not an independent awake reference.
+
+### Idle power management
+
+Default builds enable automatic light sleep with tickless idle alongside
+40–160 MHz dynamic frequency scaling. The SDK sleeps only when tasks, timer
+deadlines and peripheral power locks allow it. LVGL ticks every 5 ms, button
+sampling stays unchanged, and RC_FAST keeps the backlight PWM alive during sleep.
+The existing automatic/manual deep-sleep policy remains available.
+
+Successful shallow-sleep intervals enter a separate fractional RTC ledger.
+Their SDK contribution is removed from independent awake time, and the
+application task applies only the UTC correction difference, including removal
+of the SDK's additional libc RTC/HRT offset adjustment. PIN/protocol
+deadlines remain on their existing monotonic clocks. Stale reference timestamps
+cannot train against ambiguous sleep coordinates. A capture/accounting fault
+inhibits further light sleep and requires time synchronization before trusted
+continuation; the last qualified stored coefficient is retained.
+
+The bounded startup trace reports actual sleep/rejection counts and SDK elapsed
+sleep time. `CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y` keeps native USB available
+by preventing automatic light sleep while connected to a computer. Unplugged
+operation may sleep; radio/audio activity can also inhibit sleep.
+Enabling the configuration does not prove that the board entered it. Backlight
+continuity, buttons, sleep current and time accuracy still require device tests.
+The [design and acceptance checks](docs/assets/light-sleep-design.md) describe
+the pinned ESP-IDF sleep-context dependency and the remaining measurements.
 
 ### Fast-RC sleep correction: implementation, not hardware acceptance
 

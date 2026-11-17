@@ -7,6 +7,7 @@ idf_component_register(
          "rtc_history_store.c"
          "rtc_clock.c"
          "rtc_clock_platform.c"
+         "rtc_light_sleep_platform.c"
          "rtc_wake_stub.c"
          "passcode_guard.c"
          "fido_protocol.c"
@@ -17,5 +18,5 @@ idf_component_register(
          "auth_ui.c"
          "auth_wifi.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp bt esp_driver_tsens esp_event esp_hw_support esp_netif esp_timer esp_wifi esp_http_server nvs_flash mbedtls json
+    REQUIRES bsp bt esp_driver_tsens esp_event esp_hw_support esp_netif esp_pm esp_timer esp_wifi esp_http_server nvs_flash mbedtls json
 )

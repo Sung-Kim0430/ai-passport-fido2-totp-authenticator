@@ -16,6 +16,7 @@
 
 #include "auth_storage.h"
 #include "rtc_clock.h"
+#include "rtc_light_sleep.h"
 #include "totp_crypto.h"
 #include "passcode_guard.h"
 #include "fido_protocol.h"
@@ -698,6 +699,10 @@ static void auth_tick_task(void *param)
                          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                          (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                          (unsigned)uxTaskGetStackHighWaterMark(NULL));
+                const rtc_light_sleep_snapshot_t light = rtc_light_sleep_platform_snapshot();
+                ESP_LOGI(TAG, "LIGHT_SLEEP count=%lu rejected=%lu sdk_us=%llu fault=%u",
+                         (unsigned long)light.sleep_count, (unsigned long)light.reject_count,
+                         (unsigned long long)light.sdk_total_us, (unsigned)light.fault);
                 if (trace_ticks >= 60) clock_trace = false;
             }
             app_event_t evt = {.type = EVT_TICK};
@@ -710,12 +715,18 @@ static void auth_app_task(void *param)
 {
     (void)param;
     app_event_t evt;
+    bool light_fault_reported = false;
     if (s_cfg.auto_wipe_enabled && s_guard.failed_attempts > PASSCODE_WIPE_ATTEMPTS) {
         bool wiped = finish_automatic_wipe();
         snprintf(s_lock_msg_buf, sizeof(s_lock_msg_buf), "%s", wiped ? "TOKENS WIPED" : "WIPE INCOMPLETE");
     }
 
     while (xQueueReceive(s_evt_queue, &evt, portMAX_DELAY)) {
+        if (!rtc_clock_service_light_sleep() && !light_fault_reported) {
+            auth_time_init(false);
+            light_fault_reported = true;
+            ESP_LOGE(TAG, "Light-sleep clock reconciliation failed; time synchronization required");
+        }
         uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
         memcpy(s_settings_before, &s_cfg, sizeof(s_settings_before));
         s_settings_write_failed = false;
@@ -1366,14 +1377,22 @@ static void auth_app_task(void *param)
 static void init_power_management(void)
 {
 #if CONFIG_PM_ENABLE
+    const bool light_ready = rtc_clock_start_light_sleep();
     esp_pm_config_t pm_config = {
         .max_freq_mhz = 160,
         .min_freq_mhz = 40,
-        .light_sleep_enable = false,
+        .light_sleep_enable = light_ready,
     };
     esp_err_t err = esp_pm_configure(&pm_config);
+    if (err != ESP_OK && light_ready) {
+        rtc_light_sleep_platform_inhibit();
+        ESP_LOGW(TAG, "Automatic light sleep unavailable: %s; retrying DFS", esp_err_to_name(err));
+        pm_config.light_sleep_enable = false;
+        err = esp_pm_configure(&pm_config);
+    }
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "PMU DFS active (40-160MHz dynamic frequency scaling)");
+        ESP_LOGI(TAG, "PMU DFS active (40-160MHz), automatic light sleep=%u",
+                 (unsigned)pm_config.light_sleep_enable);
     } else {
         ESP_LOGW(TAG, "esp_pm_configure: %s", esp_err_to_name(err));
     }

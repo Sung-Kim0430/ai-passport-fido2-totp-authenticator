@@ -88,6 +88,9 @@ rtc_clock_diagnostics_t rtc_clock_diagnostics(void);
 /* 应用任务所有：启动接续在慢 BSP 初始化前执行，失败不得继续宣称 UTC 可信。 */
 rtc_clock_boot_result_t rtc_clock_boot(bool deep_wakeup, bool time_trusted);
 void rtc_clock_tick(void);
+/* 应用任务所有；失败时自动浅睡眠被禁止，调用方须撤销 UTC 可信标志。 */
+bool rtc_clock_start_light_sleep(void);
+bool rtc_clock_service_light_sleep(void);
 /* 普通期准备和传感器卸载；最终锚点另在不可逆交还完成后提交。 */
 bool rtc_clock_prepare_sleep(void);
 bool rtc_clock_commit_sleep(bool time_trusted);

@@ -1,4 +1,5 @@
 #include "rtc_clock_internal.h"
+#include "rtc_light_sleep.h"
 
 #include <limits.h>
 #include <math.h>
@@ -62,6 +63,10 @@ static struct {
     rtc_clock_session_t backup_session;
     uint32_t backup_maintenance_count;
     uint64_t corrected_elapsed_us;
+    bool light_enabled;
+    bool light_fault;
+    bool light_needs_sync;
+    rtc_light_sleep_snapshot_t light_seen;
 } s_clock;
 
 /* 位运算校验不依赖查表、日志或 libc；stub 也要在最终 ELF 中验证其放置。 */
@@ -590,6 +595,7 @@ static bool measure_period(void)
         .stamp_us = rtc_clock_platform_uptime_us(), .period_q19 = period, .valid = true,
         .temp_mc = s_clock.temperature.valid ? s_clock.temperature.temp_mc : INT32_MIN
     };
+    if (s_clock.light_enabled) rtc_light_sleep_platform_set_period(period);
     if (s_clock.temperature.valid) {
         rtc_drift_training_add(&rtc_clock_retained.training, s_clock.temperature.temp_mc, period);
         rtc_drift_model_fit(&rtc_clock_retained.training, &rtc_clock_retained.model);
@@ -606,6 +612,99 @@ static void advance_budget(int64_t hrt)
     a->coefficient_budget_us += delta < left ? delta : left;
     history_budget(delta);
     s_clock.budget_hrt_us = hrt;
+}
+
+bool rtc_clock_start_light_sleep(void)
+{
+    if (!s_clock.initialized || !s_clock.supported || s_clock.provisional || s_clock.light_fault)
+        return false;
+    if (s_clock.light_enabled) return true;
+    if (!measure_period() || !rtc_light_sleep_platform_start(s_clock.direct.period_q19, s_clock.source))
+        return false;
+    s_clock.light_seen = rtc_light_sleep_platform_snapshot();
+    s_clock.light_enabled = true;
+    return true;
+}
+
+static bool light_sleep_fault(int64_t hrt)
+{
+    rtc_light_sleep_platform_inhibit();
+    s_clock.light_fault = true;
+    s_clock.light_needs_sync = true;
+    reset_learning();
+    /* 未知区间不进入独立清醒坐标；重新校时后可从新坐标继续学习。 */
+    s_clock.execution_hrt_us = s_clock.execution_start_us = hrt;
+    s_clock.execution_valid = hrt >= 0;
+    s_clock.boot_result = RTC_CLOCK_NEEDS_SYNC;
+    seal_accounting();
+    return false;
+}
+
+static bool service_light_sleep(bool correct_utc)
+{
+    if (!s_clock.light_enabled) return true;
+    if (s_clock.light_fault) return false;
+    const rtc_light_sleep_snapshot_t sample = rtc_light_sleep_platform_snapshot();
+    const rtc_light_sleep_snapshot_t *old = &s_clock.light_seen;
+    if (sample.fault || sample.hrt_us < s_clock.execution_hrt_us ||
+        sample.sdk_total_us < old->sdk_total_us || sample.sleep_count < old->sleep_count ||
+        sample.uncertainty_total_us < old->uncertainty_total_us ||
+        rtc_clock_platform_source() != s_clock.source)
+        return light_sleep_fault(sample.hrt_us);
+    if (sample.sleep_count == old->sleep_count) return true;
+    int64_t offset_delta;
+    if (__builtin_sub_overflow(sample.wall_offset_total_us, old->wall_offset_total_us, &offset_delta))
+        return light_sleep_fault(sample.hrt_us);
+    const uint64_t sdk = sample.sdk_total_us - old->sdk_total_us;
+    const uint64_t elapsed = (uint64_t)(sample.hrt_us - s_clock.execution_hrt_us);
+    const uint64_t uncertainty = sample.uncertainty_total_us - old->uncertainty_total_us;
+    rtc_clock_accounting_t next = rtc_clock_retained.accounting;
+    rtc_drift_time_t raw, corrected;
+    if (!s_clock.execution_valid || sample.last_exit_hrt_us > sample.hrt_us ||
+        sample.last_exit_hrt_us < old->last_exit_hrt_us || sdk > elapsed ||
+        elapsed - sdk > RTC_DRIFT_MAX_ELAPSED_US - next.awake_total_us ||
+        !rtc_drift_time_sub(&sample.raw_total, &old->raw_total, &raw) ||
+        !rtc_drift_scale_time(&raw, next.active_qualified ? next.active_ppm : 0, &next.ratio, &corrected) ||
+        !rtc_drift_time_add(&next.raw_total, &raw, &next.raw_total) ||
+        !rtc_drift_time_add(&next.corrected_total, &corrected, &next.corrected_total) ||
+        (next.learning.baseline_valid && uncertainty > UINT64_MAX - next.learning.baseline.uncertainty_us))
+        return light_sleep_fault(sample.hrt_us);
+    next.awake_total_us += elapsed - sdk;
+    if (next.learning.baseline_valid) next.learning.baseline.uncertainty_us += uncertainty;
+    const uint32_t phase = next.utc_phase_q19 + corrected.fraction_q19;
+    int64_t correction = (int64_t)(corrected.us + phase / RTC_DRIFT_Q19) - (int64_t)sdk;
+    /* SDK 还会改变 libc 的 UTC 偏移；连同 HRT 替换量一起扣除。 */
+    if (__builtin_sub_overflow(correction, offset_delta, &correction))
+        return light_sleep_fault(sample.hrt_us);
+    next.utc_phase_q19 = phase % RTC_DRIFT_Q19;
+    if (correct_utc && correction) {
+        const int64_t before = rtc_clock_platform_uptime_us();
+        int64_t wall;
+        if (!rtc_clock_platform_get_wall_us(&wall)) return light_sleep_fault(sample.hrt_us);
+        const int64_t after = rtc_clock_platform_uptime_us();
+        int64_t target;
+        if (before < sample.hrt_us || after < before || after - before > CLOCK_CAPTURE_MAX_US ||
+            __builtin_add_overflow(wall, correction, &target) || target < 0)
+            return light_sleep_fault(after);
+        const int64_t adjustment = (after - before + 1) / 2;
+        if (target > INT64_MAX - adjustment || !rtc_clock_platform_set_wall_us(target + adjustment))
+            return light_sleep_fault(after);
+        const int64_t applied = rtc_clock_platform_uptime_us();
+        if (applied < after || applied - after > CLOCK_CAPTURE_MAX_US) return light_sleep_fault(applied);
+    }
+    /* 不修改 SDK 单调时钟；只结算 UTC 差额与应用自有学习坐标。 */
+    advance_budget(sample.hrt_us);
+    next.coefficient_budget_us = rtc_clock_retained.accounting.coefficient_budget_us;
+    rtc_clock_retained.accounting = next;
+    s_clock.execution_hrt_us = sample.hrt_us;
+    s_clock.light_seen = sample;
+    seal_accounting();
+    return true;
+}
+
+bool rtc_clock_service_light_sleep(void)
+{
+    return service_light_sleep(true);
 }
 
 static void checkpoint_coefficient(void)
@@ -629,6 +728,7 @@ static void checkpoint_coefficient(void)
 void rtc_clock_tick(void)
 {
     if (!s_clock.initialized || !s_clock.supported || s_clock.maintenance || s_clock.provisional) return;
+    (void)rtc_clock_service_light_sleep();
     if (rtc_clock_platform_source() != s_clock.source) {
         reset_learning();
         seal_accounting();
@@ -649,6 +749,7 @@ void rtc_clock_tick(void)
 bool rtc_clock_prepare_sleep(void)
 {
     if (!s_clock.initialized || s_clock.provisional) return false;
+    (void)rtc_clock_service_light_sleep();
     if (rtc_clock_platform_source() != s_clock.source) {
         s_clock.prepared_period = 0;
         reset_learning();
@@ -674,6 +775,8 @@ bool rtc_clock_prepare_sleep(void)
 bool rtc_clock_commit_sleep(bool time_trusted)
 {
     if (!s_clock.initialized || s_clock.provisional) return false;
+    (void)rtc_clock_service_light_sleep();
+    time_trusted = time_trusted && !s_clock.light_needs_sync;
     s_clock.backup_session = rtc_clock_retained.session;
     s_clock.backup_maintenance_count = rtc_clock_retained.accounting.maintenance_count;
     if (!rtc_drift_period_valid(s_clock.prepared_period)) {
@@ -811,6 +914,9 @@ rtc_clock_diagnostics_t rtc_clock_diagnostics(void)
 void rtc_clock_wall_time_set(void)
 {
     if (!s_clock.initialized) initialize_runtime(false, true);
+    /* 外部墙钟已经成功设置；仅结算坐标，不能把旧 UTC 差额叠加到新参考。 */
+    (void)service_light_sleep(false);
+    s_clock.light_needs_sync = false;
     if (s_clock.provisional) rtc_clock_abort_sleep();
     clear_session();
     reset_learning();
@@ -829,7 +935,8 @@ void rtc_clock_wall_time_set(void)
 static bool awake_at(int64_t hrt, uint64_t *awake)
 {
     const uint64_t total = rtc_clock_retained.accounting.awake_total_us;
-    if (!s_clock.execution_valid || hrt < s_clock.execution_start_us) return false;
+    if (!s_clock.execution_valid || hrt < s_clock.execution_start_us ||
+        (s_clock.light_enabled && hrt < s_clock.light_seen.last_exit_hrt_us)) return false;
     if (hrt < s_clock.execution_hrt_us) {
         const uint64_t age = (uint64_t)(s_clock.execution_hrt_us - hrt);
         if (age > total) return false;
@@ -886,6 +993,7 @@ static void history_environment(rtc_history_record_t *row, int64_t hrt)
 rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference_t *reference)
 {
     if (!reference || !s_clock.initialized || s_clock.provisional) return RTC_CLOCK_REFERENCE_FAILED;
+    (void)rtc_clock_service_light_sleep();
     const int64_t now = rtc_clock_platform_uptime_us();
     const uint64_t minimum = UINT64_C(1577836800) * 1000000;
     const uint64_t maximum = UINT64_C(4102444800) * 1000000;
@@ -927,6 +1035,7 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
     if (!rtc_clock_platform_set_wall_us(target)) return RTC_CLOCK_REFERENCE_FAILED;
     const int64_t after = rtc_clock_platform_uptime_us();
     const bool checked = after >= before && after - before <= CLOCK_CAPTURE_MAX_US;
+    if (checked) s_clock.light_needs_sync = false;
     if (checked) rtc_clock_retained.accounting = next;
     if (checked && capture_history) {
         rtc_clock_history_retained_t *h = &rtc_clock_retained.history;

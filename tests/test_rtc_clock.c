@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "rtc_clock_internal.h"
+#include "rtc_light_sleep.h"
 
 rtc_clock_retained_t rtc_clock_retained;
 static uint64_t ticks, rtc_us;
@@ -22,6 +23,21 @@ static rtc_clock_store_result_t coefficient_store;
 static unsigned coefficient_saves;
 static bool fail_coefficient_save;
 static bool change_source_on_tick;
+static rtc_light_sleep_snapshot_t light_snapshot;
+static uint32_t light_period;
+static bool light_inhibited, light_start_fail;
+
+bool rtc_light_sleep_platform_start(uint32_t measured_period, uint32_t clock_source) {
+    assert(clock_source == source);
+    light_period = measured_period;
+    return !light_start_fail;
+}
+void rtc_light_sleep_platform_set_period(uint32_t value) { light_period = value; }
+void rtc_light_sleep_platform_inhibit(void) { light_inhibited = true; }
+rtc_light_sleep_snapshot_t rtc_light_sleep_platform_snapshot(void) {
+    light_snapshot.hrt_us = uptime_us;
+    return light_snapshot;
+}
 
 uint32_t rtc_clock_platform_source(void) { return source; }
 rtc_clock_store_result_t rtc_clock_platform_load_coefficient(int32_t *out) {
@@ -156,6 +172,9 @@ static void reset_all(void) {
     coefficient_saves = source = 0;
     stored_ppm = 0;
     fail_coefficient_save = change_source_on_tick = false;
+    memset(&light_snapshot, 0, sizeof light_snapshot);
+    light_period = 0;
+    light_inhibited = light_start_fail = false;
     memset(&stored_model, 0, sizeof stored_model);
 }
 static int64_t prepare_session(void) {
@@ -1143,6 +1162,153 @@ static void check_history_shadow_reload_and_age(void) {
     assert(view.active_ppm == -870 && stored_ppm == -870);
 }
 
+static void simulate_light_sleep(uint64_t duration_us) {
+    const uint64_t start = ticks;
+    advance_fake((int64_t)duration_us);
+    assert(rtc_light_sleep_record(&light_snapshot, start, ticks,
+        3U * RTC_DRIFT_Q19, light_period, uptime_us));
+}
+
+static void check_light_sleep_coordinates_and_utc(void) {
+    for (int sign = -1; sign <= 1; sign += 2) {
+        reset_all();
+        stored_ppm = sign * 10000;
+        coefficient_store = RTC_CLOCK_STORE_VALID;
+        rtc_clock_boot(false, true);
+        assert(rtc_clock_start_light_sleep());
+        advance_fake(60000);
+        const int64_t initial_wall = wall_us;
+        simulate_light_sleep(600000);
+        advance_fake(30000);
+        assert(rtc_clock_service_light_sleep());
+        rtc_clock_diagnostics_t d = rtc_clock_diagnostics();
+        assert(d.awake_total_us == 90000 && d.raw_chain_us == 600000);
+        const uint64_t corrected = UINT64_C(600000000000) / (uint32_t)(1000000 + stored_ppm);
+        assert(d.corrected_chain_us == corrected);
+        assert(wall_us == initial_wall + (int64_t)corrected + 30000);
+        const unsigned applied = sets;
+        assert(rtc_clock_service_light_sleep());
+        assert(sets == applied && rtc_clock_diagnostics().awake_total_us == 90000);
+        simulate_light_sleep(300000);
+        assert(rtc_clock_service_light_sleep());
+        d = rtc_clock_diagnostics();
+        assert(d.awake_total_us == 90000 && d.raw_chain_us == 900000);
+        assert(rtc_clock_prepare_sleep());
+        simulate_light_sleep(3000);
+        assert(rtc_clock_commit_sleep(true));
+        assert(rtc_clock_retained.accounting.awake_total_us == 90000);
+        const uint64_t before_raw = rtc_clock_retained.accounting.raw_total.us;
+        ticks += 100000;
+        wall_us += 300000;
+        reboot_runtime();
+        assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+        assert(rtc_clock_diagnostics().raw_chain_us == before_raw + 300000);
+    }
+}
+
+static void check_light_sleep_reference_and_failures(void) {
+    reset_all();
+    rtc_clock_boot(false, true);
+    assert(rtc_clock_start_light_sleep());
+    rtc_clock_tick();
+    rtc_clock_reference_t ref = reference_now(1, (uint64_t)wall_us);
+    simulate_light_sleep(300000);
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+    assert(!rtc_clock_retained.accounting.learning.baseline_valid);
+    ref = reference_now(2, (uint64_t)wall_us);
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+    assert(rtc_clock_retained.accounting.learning.baseline_valid);
+    assert(rtc_clock_retained.accounting.learning.baseline.awake_us == 0);
+    const uint64_t uncertainty = rtc_clock_retained.accounting.learning.baseline.uncertainty_us;
+    simulate_light_sleep(300000);
+    assert(rtc_clock_service_light_sleep());
+    assert(rtc_clock_retained.accounting.learning.baseline.uncertainty_us > uncertainty);
+
+    reset_all();
+    rtc_clock_boot(false, true);
+    light_start_fail = true;
+    assert(!rtc_clock_start_light_sleep());
+    light_start_fail = false;
+    assert(rtc_clock_start_light_sleep());
+    light_snapshot.fault = true;
+    assert(!rtc_clock_service_light_sleep() && light_inhibited);
+
+    reset_all();
+    stored_ppm = 10000; coefficient_store = RTC_CLOCK_STORE_VALID;
+    rtc_clock_boot(false, true);
+    assert(rtc_clock_start_light_sleep());
+    simulate_light_sleep(300000);
+    fail_set = true;
+    assert(!rtc_clock_service_light_sleep() && light_inhibited);
+    assert(rtc_clock_diagnostics().ppm_qualified);
+    fail_set = false;
+    assert(!rtc_clock_service_light_sleep()); // No partial retry or duplicate UTC.
+}
+
+static void check_light_sleep_fractions_and_manual_sync(void) {
+    reset_all();
+    rtc_clock_boot(false, true);
+    assert(rtc_clock_start_light_sleep());
+    light_period = 3U * RTC_DRIFT_Q19 + RTC_DRIFT_Q19 / 2;
+    const int64_t before = wall_us;
+    for (unsigned i = 0; i < 100; ++i) {
+        simulate_light_sleep(3);
+        assert(rtc_clock_service_light_sleep());
+        assert(wall_us == before + (int64_t)((i + 1) * 7 / 2));
+    }
+    assert(rtc_clock_diagnostics().awake_total_us == 0);
+    assert(rtc_clock_diagnostics().raw_chain_us == 350);
+    simulate_light_sleep(300000);
+    wall_us = INT64_C(1800000000123456); // The caller has just set external UTC.
+    const unsigned old_sets = sets;
+    rtc_clock_wall_time_set();
+    assert(wall_us == INT64_C(1800000000123456) && sets == old_sets);
+    assert(rtc_clock_service_light_sleep());
+    assert(wall_us == INT64_C(1800000000123456));
+    assert(rtc_clock_diagnostics().raw_chain_us == 350350);
+    assert(rtc_clock_diagnostics().awake_total_us == 0);
+}
+
+static void check_light_sleep_failed_correction_cannot_restore_trust(void) {
+    reset_all();
+    stored_ppm = 10000; coefficient_store = RTC_CLOCK_STORE_VALID;
+    rtc_clock_boot(false, true);
+    assert(rtc_clock_start_light_sleep());
+    simulate_light_sleep(300000);
+    fail_set = true;
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    assert(!rtc_clock_retained.session.utc_trusted);
+    assert(rtc_clock_abort_sleep());
+    fail_set = false;
+    rtc_clock_reference_t ref = reference_now(42, (uint64_t)wall_us);
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    assert(rtc_clock_retained.session.utc_trusted);
+}
+
+static void check_light_sleep_sdk_libc_offset(void) {
+    reset_all();
+    rtc_clock_boot(false, true);
+    assert(rtc_clock_start_light_sleep());
+    const int64_t before = wall_us;
+    advance_fake(999999);
+    simulate_light_sleep(30000);
+    // esp_set_time_from_rtc() overwrites the libc RTC/HRT offset after sleep.
+    light_snapshot.wall_offset_total_us = 100;
+    wall_us += 100;
+    assert(rtc_clock_service_light_sleep());
+    assert(wall_us == before + 1029999);
+    assert(rtc_clock_diagnostics().awake_total_us == 999999);
+    simulate_light_sleep(30000);
+    light_snapshot.wall_offset_total_us -= 250;
+    wall_us -= 250;
+    assert(rtc_clock_service_light_sleep());
+    assert(wall_us == before + 1059999);
+    const unsigned old_sets = sets;
+    assert(rtc_clock_service_light_sleep());
+    assert(sets == old_sets);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         if (!strcmp(argv[1], "init")) check_history_init_recovery();
@@ -1152,6 +1318,11 @@ int main(int argc, char **argv) {
         reboot_runtime();
         return 0;
     }
+    check_light_sleep_coordinates_and_utc();
+    check_light_sleep_reference_and_failures();
+    check_light_sleep_fractions_and_manual_sync();
+    check_light_sleep_failed_correction_cannot_restore_trust();
+    check_light_sleep_sdk_libc_offset();
     check_history_init_recovery();
     check_history_populated_init_recovery();
     check_history_shadow_reload_and_age();
