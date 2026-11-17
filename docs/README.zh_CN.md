@@ -41,6 +41,8 @@
 | --- | --- | --- |
 | 开放固件与可复用示例，为你的创意留出发挥空间。 | 从一个简单想法出发，跟随清晰指南把它变成现实。 | 打造随身伙伴、小工具、游戏，或任何你能想到的东西。 |
 
+本分支的认证器应用说明见 [Passport Auth README](../README.zh_CN.md)。
+
 ## 找到你的起点
 
 | 我想要…… | 从这里开始 |
@@ -204,6 +206,7 @@ LICENSE                  仓库许可证
 | [硬件资料](hardware-design/README.zh_CN.md) | 板卡事实、接口边界、验收清单与排障 |
 | [中文字体](development/engineering/lvgl-chinese-fonts.zh_CN.md) | 字形覆盖、控件字体选择，以及中文空白排查 |
 | [Wi-Fi 配网](development/engineering/wifi-provisioning.zh_CN.md) | 蓝牙配网实现参考与配套小程序 |
+| [RTC 校准设计与计划](assets/rtc-calibration-design.zh_CN.md) | 认证器温度学习、周期维护、唤醒竞态及验证边界 |
 | [社区作品与经验](reference/README.zh_CN.md) | `docs/reference/<username>/` 下的应用档案和可复用知识 |
 | [参与贡献](contribution/README.zh_CN.md) | 文档、提交与 Pull Request 约定 |
 | [品牌素材](brand/README.zh_CN.md) | 产品视觉参考与[品牌说明](brand/brand-and-product.zh_CN.md) |

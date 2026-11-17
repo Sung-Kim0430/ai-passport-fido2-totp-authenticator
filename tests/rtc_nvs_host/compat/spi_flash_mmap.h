@@ -1,0 +1,6 @@
+#ifndef RTC_NVS_HOST_SPI_FLASH_MMAP_H
+#define RTC_NVS_HOST_SPI_FLASH_MMAP_H
+#include "esp_err.h"
+#define SPI_FLASH_SEC_SIZE 4096
+#define ESP_ERR_FLASH_OP_FAIL (ESP_ERR_FLASH_BASE + 1)
+#endif

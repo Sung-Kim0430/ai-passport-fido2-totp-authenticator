@@ -1,0 +1,25 @@
+menu "Authenticator clock"
+
+config AUTH_RTC_MAINTENANCE
+    bool "Periodic SDK RTC maintenance"
+    default y
+    depends on IDF_TARGET_ESP32C3 && RTC_CLK_SRC_INT_8MD256
+    help
+        Wake every 900 seconds through the normal SDK startup path, refresh
+        the selected RTC source calibration, and return to deep sleep without
+        initializing the display, audio, or radios. Observed key activity,
+        invalid continuation, and rejected sleep enter the full application.
+        Validate key coverage, UTC continuity, and whole-board power on device.
+
+config AUTH_RTC_WAKE_STUB
+    bool "Experimental RTC maintenance wake stub"
+    default n
+    depends on IDF_TARGET_ESP32C3 && RTC_CLK_SRC_INT_RC && !AUTH_RTC_MAINTENANCE
+    help
+        Enable timer-only RTC maintenance with interruptible RC calibration.
+        This requires the pinned IDF 5.5.6 RTC/ROM placement audit and on-device
+        key-pulse, wake/re-sleep and power acceptance. Keep disabled in an
+        ordinary release until those hardware checks pass. GPIO-only sleep
+        compensation and normal runtime temperature learning remain available.
+
+endmenu

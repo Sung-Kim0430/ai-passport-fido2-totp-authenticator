@@ -41,5 +41,6 @@ int esp_codec_dev_close(esp_codec_dev_handle_t);
 void esp_codec_dev_delete(esp_codec_dev_handle_t);
 int esp_codec_dev_set_in_gain(esp_codec_dev_handle_t, float);
 int esp_codec_dev_set_out_vol(esp_codec_dev_handle_t, int);
+int esp_codec_dev_set_out_mute(esp_codec_dev_handle_t, bool);
 int esp_codec_dev_write(esp_codec_dev_handle_t, void *, int);
 int esp_codec_dev_read(esp_codec_dev_handle_t, void *, int);

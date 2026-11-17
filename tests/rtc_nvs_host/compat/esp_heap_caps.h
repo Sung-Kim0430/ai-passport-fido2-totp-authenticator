@@ -1,0 +1,3 @@
+#ifndef RTC_NVS_HOST_ESP_HEAP_CAPS_H
+#define RTC_NVS_HOST_ESP_HEAP_CAPS_H
+#endif

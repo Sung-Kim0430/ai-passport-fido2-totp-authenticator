@@ -241,6 +241,13 @@ int esp_codec_dev_set_out_vol(esp_codec_dev_handle_t dev, int volume) {
     (void)codec_write((struct test_codec *)dev->codec, 0x32, (uint8_t)volume);
     return ESP_OK;
 }
+// 用真实控制接口记录静音，保证待机测试仍能注入 I2C 写失败。
+static bool out_muted;
+int esp_codec_dev_set_out_mute(esp_codec_dev_handle_t dev, bool mute) {
+    int result = codec_write((struct test_codec *)dev->codec, 0x31, mute ? 0x60 : 0x00);
+    if (result == ESP_OK) out_muted = mute;
+    return result;
+}
 int esp_codec_dev_write(esp_codec_dev_handle_t dev, void *pcm, int bytes) {
     return dev->data->write(dev->data, pcm, bytes);
 }
@@ -272,7 +279,51 @@ static void assert_active(void) {
     assert(registers[0x0d] == 0x01 && registers[0x0e] == 0x02);
 }
 
+// 待机保留配置与偏置；Off 才销毁 codec，循环唤醒不得增长接口数量。
+static void test_standby_modes(void) {
+    int16_t pcm[8] = {0};
+    fresh();
+    assert(bsp_audio_init() == ESP_OK);
+    assert(bsp_audio_set_format(16000, 16, 1) == ESP_OK);
+    bsp_audio_set_volume(77);
+    unsigned created = codec_creations;
+    for (unsigned i = 0; i < 256; ++i) {
+        assert(bsp_audio_standby() == ESP_OK);
+        assert(bsp_audio_standby() == ESP_OK);
+        assert(s_standby && !s_sleeping && s_opened && s_dev && s_codec);
+        assert(out_muted && !s_tx->running && !s_rx->running);
+        assert(registers[0x0d] == 1 && registers[0x0e] == 2);
+        assert(bsp_audio_write(pcm, sizeof(pcm)) == ESP_ERR_INVALID_STATE);
+        assert(bsp_audio_wake() == ESP_OK);
+        assert(!s_standby && !out_muted && s_tx->running && s_rx->running);
+        assert(codec_creations == created);
+    }
+    assert(bsp_audio_standby() == ESP_OK);
+    assert(bsp_audio_sleep() == ESP_OK);
+    assert(s_sleeping && !s_standby && !s_dev && !s_codec);
+    assert(registers[0x0d] == 0xfc && registers[0x45] == 1);
+    assert(bsp_audio_wake() == ESP_OK);
+    assert(codec_creations == created + 1);
+    assert(bsp_audio_standby() == ESP_OK);
+    assert(bsp_audio_set_format(8000, 16, 1) == ESP_OK);
+    assert(!s_standby && s_tx->hz == 8000 && s_rx->hz == 8000);
+
+    fresh();
+    assert(bsp_audio_init() == ESP_OK);
+    assert(bsp_audio_set_format(16000, 16, 1) == ESP_OK);
+    fault(0x31, 0x60, 1);
+    assert(bsp_audio_standby() == ESP_FAIL);
+    assert_rollback();
+    assert(bsp_audio_wake() == ESP_OK);
+    assert(bsp_audio_standby() == ESP_OK);
+    fault(0x31, 0, 1);
+    assert(bsp_audio_wake() == ESP_FAIL);
+    assert_rollback();
+    assert(bsp_audio_wake() == ESP_OK);
+}
+
 int main(void) {
+    test_standby_modes();
     fresh();
     bsp_audio_set_volume(43);
     assert(bsp_audio_set_format(16000, 16, 1) == ESP_OK);

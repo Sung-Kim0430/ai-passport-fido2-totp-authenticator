@@ -26,6 +26,8 @@ static uint32_t s_hz;
 static uint8_t  s_bits, s_ch;
 static bool     s_opened;
 static bool     s_sleeping;
+// 待机保留 codec/格式，只静音并暂停 I2S；完整 Off 才释放 codec 对象。
+static bool     s_standby;
 static bool     s_initialized;
 static esp_err_t s_sleep_result;
 static bool     s_codec_release_failed;
@@ -243,6 +245,12 @@ static esp_err_t audio_prepare_i2s_reopen(void) {
 
 // esp_codec_dev 不拥有传入的接口和 I2S channel；失败回滚必须按依赖逆序逐一释放。
 static void audio_delete_codec(void) {
+    // 待机只停了硬件传输，codec-dev 仍认为数据已启用；删除前在静音状态下
+    // 恢复 channel，保证正常 close 能同步清除依赖内部的启用标志。
+    if (s_standby) {
+        audio_track_error(audio_prepare_i2s_reopen());
+        s_standby = false;
+    }
     if (s_dev) {
         esp_codec_dev_delete(s_dev);
         s_dev = NULL;
@@ -291,6 +299,7 @@ static void audio_cleanup(void) {
     }
     s_opened = false;
     s_sleeping = false;
+    s_standby = false;
     s_initialized = false;
     s_sleep_result = ESP_OK;
     s_volume = 0;
@@ -484,6 +493,27 @@ fail:
     return e == ESP_OK ? ESP_FAIL : e;
 }
 
+esp_err_t bsp_audio_standby(void) {
+    if (!s_initialized || s_sleeping || s_standby) return ESP_OK;
+    if (!s_opened || !s_dev) return ESP_ERR_INVALID_STATE;
+
+    // 保留参考偏置和 codec 配置，仅静音并暂停 TX/RX，下一次无需重建对象。
+    s_io_error = ESP_CODEC_DEV_OK;
+    int result = esp_codec_dev_set_out_mute(s_dev, true);
+    if (result != ESP_CODEC_DEV_OK || s_io_error != ESP_CODEC_DEV_OK) {
+        (void)bsp_audio_sleep();
+        return ESP_FAIL;
+    }
+    s_standby = true;
+    esp_err_t error = audio_disable_i2s_channels();
+    if (error != ESP_OK) {
+        (void)bsp_audio_sleep();
+        return error;
+    }
+    ESP_LOGI(TAG, "ES8311 待机：静音、暂停 I2S，保留配置和偏置");
+    return ESP_OK;
+}
+
 esp_err_t bsp_audio_sleep(void) {
     if (!s_initialized) return ESP_OK;
     if (s_sleeping) return s_sleep_result;
@@ -534,33 +564,46 @@ esp_err_t bsp_audio_prepare_deep_sleep(void) {
 }
 
 esp_err_t bsp_audio_wake(void) {
-    if (!s_initialized || !s_sleeping) return ESP_OK;
+    if (!s_initialized || (!s_sleeping && !s_standby)) return ESP_OK;
 
-    // 允许内部格式设置重新 open codec；失败时再次 close，避免留下半唤醒状态。
-    s_sleeping = false;
-    esp_err_t e = bsp_audio_set_format(s_hz ? s_hz : AUDIO_DEFAULT_HZ,
-                             s_bits ? s_bits : AUDIO_DEFAULT_BITS,
-                             s_ch ? s_ch : AUDIO_DEFAULT_CH);
+    esp_err_t e;
+    if (s_standby) {
+        // codec-dev 的逻辑状态未改变；只恢复此前暂停的硬件 channel。
+        e = audio_prepare_i2s_reopen();
+        if (e == ESP_OK) s_standby = false;
+    } else {
+        // Off 已释放 codec 对象，沿用缓存的格式重建，并验证实际启动结果。
+        s_sleeping = false;
+        e = bsp_audio_set_format(s_hz ? s_hz : AUDIO_DEFAULT_HZ,
+                                s_bits ? s_bits : AUDIO_DEFAULT_BITS,
+                                s_ch ? s_ch : AUDIO_DEFAULT_CH);
+    }
+    if (e == ESP_OK) {
+        s_io_error = ESP_CODEC_DEV_OK;
+        int result = esp_codec_dev_set_out_mute(s_dev, false);
+        if (result != ESP_CODEC_DEV_OK || s_io_error != ESP_CODEC_DEV_OK) e = ESP_FAIL;
+    }
     if (e != ESP_OK) {
-        s_opened = false;
-        s_sleeping = true;
+        // 任一步失败都退回 Off，不允许 PCM 访问半唤醒的 codec。
+        (void)bsp_audio_sleep();
         s_sleep_result = e;
         ESP_LOGE(TAG, "ES8311 唤醒失败: %s", esp_err_to_name(e));
         return e;
     }
 
+    s_standby = false;
     s_sleep_result = ESP_OK;
-    ESP_LOGI(TAG, "ES8311 已从低功耗状态恢复");
+    ESP_LOGD(TAG, "ES8311 已从低功耗状态恢复");
     return ESP_OK;
 }
 
 esp_err_t bsp_audio_write(const void *pcm, size_t bytes) {
-    if (!s_dev || !s_opened || s_sleeping) return ESP_ERR_INVALID_STATE;
+    if (!s_dev || !s_opened || s_sleeping || s_standby) return ESP_ERR_INVALID_STATE;
     return esp_codec_dev_write(s_dev, (void *)pcm, bytes) == 0 ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t bsp_audio_read(void *pcm, size_t bytes) {
-    if (!s_dev || !s_opened || s_sleeping) return ESP_ERR_INVALID_STATE;
+    if (!s_dev || !s_opened || s_sleeping || s_standby) return ESP_ERR_INVALID_STATE;
     return esp_codec_dev_read(s_dev, pcm, bytes) == 0 ? ESP_OK : ESP_FAIL;
 }
 

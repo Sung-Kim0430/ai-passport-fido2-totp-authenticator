@@ -29,6 +29,14 @@ esp_err_t bsp_audio_set_format(uint32_t hz, uint8_t bits, uint8_t ch);
 // 内部 enabled 标志恢复，唤醒会重新创建 codec 并恢复音量/格式。
 esp_err_t bsp_audio_sleep(void);
 
+/**
+ * @brief 可恢复待机：静音并停止 I2S 传输，保留 codec 配置和偏置。
+ *
+ * 不切断物理供电，也不销毁 codec 对象。播放前调用 bsp_audio_wake()；
+ * 完整软件关断使用 bsp_audio_sleep()，读写不会隐式离开待机。
+ */
+esp_err_t bsp_audio_standby(void);
+
 // deep sleep 专用：确保 I2S TX/RX 已停止，再将 MCLK/BCLK/WS/DOUT/DIN
 // 设为无上下拉的高阻输入。调用后 I2S 不能在本次运行中恢复，必须立即
 // 进入 deep sleep 或重启；不得用于 light sleep。

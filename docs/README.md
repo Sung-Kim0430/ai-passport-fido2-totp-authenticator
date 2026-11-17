@@ -42,6 +42,8 @@ it anything—from a pocket companion to something no one has imagined yet.
 | --- | --- | --- |
 | Open firmware and reusable examples give you room to shape your own experience. | Start from an idea and follow clear guides to make it real, even if this is your first build. | Make a companion, a tool, a game—or anything you can imagine. |
 
+For this fork's authenticator application, see the [Passport Auth README](../README.md).
+
 ## Find your starting point
 
 | I want to… | Start here |
@@ -210,6 +212,7 @@ provide reference material. Choose the entry that matches your task.
 | [Hardware](hardware-design/README.md) | Board facts, interface boundaries, acceptance checklists, and troubleshooting |
 | [Chinese fonts](development/engineering/lvgl-chinese-fonts.md) | Glyph coverage, widget font selection, and blank-text troubleshooting |
 | [Wi-Fi provisioning](development/engineering/wifi-provisioning.md) | Bluetooth provisioning reference and companion mini program |
+| [RTC calibration design and plan](assets/rtc-calibration-design.md) | Authenticator temperature learning, periodic maintenance, wake races, and validation boundaries |
 | [Community projects and experience](reference/README.md) | Playbooks and reusable knowledge under `docs/reference/<username>/` |
 | [Contributing](contribution/README.md) | Documentation, commits, and pull-request conventions |
 | [Brand assets](brand/README.md) | Product visual references and [brand language](brand/brand-and-product.md) |

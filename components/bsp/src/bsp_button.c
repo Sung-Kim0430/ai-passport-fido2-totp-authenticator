@@ -38,28 +38,56 @@ static bsp_adc_button_t s_drivers[BSP_BTN_COUNT];
 static int64_t s_sample_time;
 static int s_sample_mv = -1;
 static bool s_sample_valid;
+// 初始化/清理之外，这些状态仅由组件共享定时器中的采样与事件回调更新。
+static uint8_t s_active_gestures;
+static bool s_release_qualifying;
+static int64_t s_release_since;
+static bool s_idle_notified;
+
+static void qualify_idle(int64_t now) {
+    if (s_active_gestures || s_sample_mv < BSP_BTN_MV_RELEASED_MIN) {
+        s_release_qualifying = false;
+        s_idle_notified = false;
+        return;
+    }
+    if (s_idle_notified) return;
+    if (!s_release_qualifying) {
+        s_release_since = now;
+        s_release_qualifying = true;
+        return;
+    }
+    const int64_t stable_us = (int64_t)CONFIG_BUTTON_PERIOD_TIME_MS *
+                              CONFIG_BUTTON_DEBOUNCE_TICKS * 1000;
+    if (now - s_release_since < stable_us) return;
+    s_idle_notified = true;
+    // 整板通知不属于某个键，索引只作占位；不用会停止 ADC 轮询的省电模式。
+    if (s_cb) s_cb(BSP_BTN_UP, BSP_BTN_IDLE, s_user);
+}
 
 static uint8_t button_level(button_driver_t *driver) {
     if (!s_ready) return BUTTON_INACTIVE;
     const bsp_adc_button_t *button = (const bsp_adc_button_t *)driver;
     const int64_t now = esp_timer_get_time();
-    // Share one averaged reading across the three keys in a polling cycle.
+    // 三键共用每轮的一次平均采样；失败也缓存，不能在同轮误判为稳定松开。
     if (!s_sample_valid || now - s_sample_time >= 1000) {
         int sum = 0;
+        bool valid = true;
         s_sample_time = now;
         s_sample_valid = true;
         s_sample_mv = -1;
         for (int i = 0; i < CONFIG_ADC_BUTTON_SAMPLE_TIMES; ++i) {
             int raw;
             if (adc_oneshot_read(s_adc, BSP_BTN_ADC_CHANNEL, &raw) != ESP_OK) {
-                return BUTTON_INACTIVE;
+                valid = false;
+                break;
             }
             sum += raw;
         }
-        if (adc_cali_raw_to_voltage(s_cali, sum / CONFIG_ADC_BUTTON_SAMPLE_TIMES,
-                                   &s_sample_mv) != ESP_OK) {
+        if (valid && adc_cali_raw_to_voltage(s_cali, sum / CONFIG_ADC_BUTTON_SAMPLE_TIMES,
+                                             &s_sample_mv) != ESP_OK) {
             s_sample_mv = -1;
         }
+        qualify_idle(now);
     }
     // Half-open windows prevent two keys from matching a shared boundary.
     return s_sample_mv >= BTN_MV[button->index][0] &&
@@ -77,11 +105,23 @@ static void on_event(void *arg, void *usr_data, bsp_btn_ev_t ev) {
     if (!s_ready || !s_cb) return;
     s_cb((bsp_btn_t)(intptr_t)usr_data, ev, s_user);
 }
-static void cb_press (void *a, void *u) { on_event(a, u, BSP_BTN_PRESS);  }
+static void cb_press(void *a, void *u) {
+    if (!s_ready) return;
+    s_active_gestures |= (uint8_t)(1u << (unsigned)(uintptr_t)u);
+    s_release_qualifying = false;
+    s_idle_notified = false;
+    on_event(a, u, BSP_BTN_PRESS);
+}
 static void cb_click (void *a, void *u) { on_event(a, u, BSP_BTN_CLICK);  }
 static void cb_double(void *a, void *u) { on_event(a, u, BSP_BTN_DOUBLE); }
 static void cb_long  (void *a, void *u) { on_event(a, u, BSP_BTN_LONG);   }
 static void cb_release(void *a, void *u) { on_event(a, u, BSP_BTN_RELEASE); }
+static void cb_end(void *a, void *u) {
+    (void)a;
+    if (!s_ready) return;
+    // PRESS_UP 后还有单击/双击尾事件，只有组件 PRESS_END 才清除本键手势。
+    s_active_gestures &= (uint8_t)~(1u << (unsigned)(uintptr_t)u);
+}
 
 // 初始化中途失败时先停掉所有 button driver，再释放本文件持有的校准与 ADC unit。
 // button driver 仍在轮询时不能先删 ADC，否则 timer callback 会访问失效句柄。
@@ -93,6 +133,12 @@ static esp_err_t button_cleanup(void) {
     s_user = NULL;
     s_ready = false;
     s_sample_valid = false;
+    s_sample_time = 0;
+    s_sample_mv = -1;
+    s_active_gestures = 0;
+    s_release_qualifying = false;
+    s_release_since = 0;
+    s_idle_notified = false;
 
     for (int i = BSP_BTN_COUNT - 1; i >= 0; i--) {
         if (!s_btn[i]) continue;
@@ -140,6 +186,7 @@ static esp_err_t register_callbacks(button_handle_t button, void *index) {
     if (e == ESP_OK) e = iot_button_register_cb(button, BUTTON_DOUBLE_CLICK, NULL, cb_double, index);
     if (e == ESP_OK) e = iot_button_register_cb(button, BUTTON_LONG_PRESS_START, NULL, cb_long, index);
     if (e == ESP_OK) e = iot_button_register_cb(button, BUTTON_PRESS_UP, NULL, cb_release, index);
+    if (e == ESP_OK) e = iot_button_register_cb(button, BUTTON_PRESS_END, NULL, cb_end, index);
     return e;
 }
 
@@ -160,6 +207,10 @@ esp_err_t bsp_button_init(bsp_btn_cb_t cb, void *user) {
         }
     }
 
+    s_active_gestures = 0;
+    s_release_qualifying = false;
+    s_release_since = 0;
+    s_idle_notified = false;
     s_cb = cb; s_user = user;
 
     // BSP owns one ADC unit and one calibration handle for polling and reads.
