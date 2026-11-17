@@ -117,10 +117,12 @@ static void fire(bsp_btn_t btn, button_event_t ev) {
     h->callbacks[ev](h, h->users[ev]);
 }
 static void event_cb(bsp_btn_t btn, bsp_btn_ev_t ev, void *u) {
+    if (ev == BSP_BTN_IDLE) { assert(u == &events); return; }
     assert(btn == BSP_BTN_OK && ev == BSP_BTN_CLICK && u == &events);
     ++events;
 }
 static void updated_event_cb(bsp_btn_t btn, bsp_btn_ev_t ev, void *u) {
+    if (ev == BSP_BTN_IDLE) { assert(u == &updated_events); return; }
     assert(btn == BSP_BTN_OK && ev == BSP_BTN_CLICK && u == &updated_events);
     ++updated_events;
 }
@@ -186,13 +188,75 @@ static void retry_success(void) {
     assert(updated_events == before + 1);
     assert(button_cleanup() == ESP_OK); assert_clean();
 }
-static void check_voltage(int mv, int expected) {
-    raw_mv = mv; clock_us += 2000;
-    const int before = reads;
+// One button-component polling cycle (5 ms): every driver asks for its level.
+static int poll(void) {
+    clock_us += 5000;
+    int active = -1;
     for (int i = 0; i < BSP_BTN_COUNT; ++i) {
-        assert(s_drivers[i].base.get_key_level(&s_drivers[i].base) == (i == expected));
+        if (s_drivers[i].base.get_key_level(&s_drivers[i].base) == BUTTON_ACTIVE) {
+            assert(active == -1);   // never two keys at once
+            active = i;
+        }
     }
-    assert(reads - before == CONFIG_ADC_BUTTON_SAMPLE_TIMES);
+    return active;
+}
+// Hold a voltage for ms and return the decoded key afterwards.
+static int hold(int mv, int ms) {
+    raw_mv = mv;
+    int active = -1;
+    for (int t = 0; t < ms; t += 5) active = poll();
+    return active;
+}
+static void check_voltage(int mv, int expected) {
+    assert(hold(mv, 200) == expected);   // longer than confirm and hold windows
+    const int before = reads;
+    assert(poll() == expected);
+    assert(reads - before == CONFIG_ADC_BUTTON_SAMPLE_TIMES);   // one shared sample
+}
+
+// Issue #97: a contact break inside a held key sweeps the voltage up through the
+// windows above it. The lock must neither report the neighbour nor end the hold.
+static void check_key_lock(void) {
+    const int released = 3300, up = 50, down = 300, ok = 600;
+    assert(hold(released, 200) == -1);
+
+    // Press-down: a key must be stable for the confirm time, and the windows swept
+    // through while the voltage falls are never reported.
+    assert(hold(ok, 20) == -1 && hold(down, 20) == -1);
+    assert(hold(up, BSP_BTN_CONFIRM_MS - 10) == -1);
+    assert(hold(up, 20) == BSP_BTN_UP);
+
+    // Held UP: a contact break dwells in DOWN, OK, then released for tens of ms
+    // each, far longer than the component's ~10 ms debounce, then recovers.
+    const uint32_t glitches = bsp_button_glitch_count();
+    for (int i = 0; i < 5; ++i) {
+        assert(hold(down, 30) == BSP_BTN_UP);
+        assert(hold(ok, 40) == BSP_BTN_UP);
+        assert(hold(released, 40) == BSP_BTN_UP);
+        assert(hold(up, 30) == BSP_BTN_UP);
+    }
+    assert(bsp_button_glitch_count() == glitches + 5);
+
+    // A real release is reported once it lasts the hold time, including the sweep
+    // through the upper windows on the way out.
+    assert(hold(down, 10) == BSP_BTN_UP && hold(ok, 10) == BSP_BTN_UP);
+    assert(hold(released, BSP_BTN_HOLD_MS - 10) == BSP_BTN_UP);
+    assert(hold(released, 20) == -1);
+
+    // A failed read counts as "no key": it cannot press, and a held key survives it.
+    fail_read = 1; assert(hold(0, 200) == -1); fail_read = 0;
+    assert(hold(ok, 100) == BSP_BTN_OK);
+    fail_read = 1; assert(hold(0, 60) == BSP_BTN_OK); fail_read = 0;
+    assert(hold(ok, 20) == BSP_BTN_OK);
+    assert(hold(released, 200) == -1);
+
+    // Re-initialization after a teardown starts from "no key" again.
+    assert(hold(down, 100) == BSP_BTN_DOWN);
+    assert(button_cleanup() == ESP_OK);
+    assert(bsp_button_init(event_cb, &events) == ESP_OK);
+    raw_mv = released;
+    assert(poll() == -1);
+    assert(hold(released, 200) == -1);
 }
 
 static const int64_t period_us = CONFIG_BUTTON_PERIOD_TIME_MS * 1000LL;
@@ -223,9 +287,8 @@ static void poll_pad(int mv, int64_t advance_us) {
     raw_mv = mv; clock_us += advance_us;
     const int before = reads;
     for (int i = BSP_BTN_COUNT - 1; i >= 0; --i) {
-        const uint8_t expected = !fail_read && !fail_convert &&
-            mv >= BTN_MV[i][0] && mv < BTN_MV[i][1];
-        assert(buttons[i].driver->get_key_level(buttons[i].driver) == expected);
+        const uint8_t level = buttons[i].driver->get_key_level(buttons[i].driver);
+        assert(level == (s_decoder.locked == i));
     }
     // 即便 ADC 失败，同一轮三个键也只能共享一次采样尝试。
     assert(reads - before == (fail_read ? 1 : CONFIG_ADC_BUTTON_SAMPLE_TIMES));
@@ -380,6 +443,37 @@ static void check_second_key_before_first_end(void) {
     fire(BSP_BTN_DOWN, BUTTON_PRESS_END);
     check_stable_idle();
 }
+static void check_key_lock_with_wake_guard(void) {
+    start_behavior();
+    poll_pad(0, period_us);
+    poll_pad(0, BSP_BTN_CONFIRM_MS * 1000LL);
+    assert(s_decoder.locked == BSP_BTN_UP);
+    fire(BSP_BTN_UP, BUTTON_PRESS_DOWN);
+
+    // A contact break must preserve both the decoded key and wake isolation.
+    poll_pad(300, period_us);
+    poll_pad(600, 30000);
+    poll_pad(3300, 40000);
+    poll_pad(0, 30000);
+    assert(s_decoder.locked == BSP_BTN_UP);
+    assert(wake_guard.armed && idle_count == 0 && delivered == 0);
+    fire(BSP_BTN_UP, BUTTON_LONG_PRESS_START);
+
+    poll_pad(3300, period_us);
+    poll_pad(3300, BSP_BTN_HOLD_MS * 1000LL);
+    assert(s_decoder.locked == -1 && wake_guard.armed);
+    fire(BSP_BTN_UP, BUTTON_PRESS_UP);
+    fire(BSP_BTN_UP, BUTTON_PRESS_END);
+    check_stable_idle();
+    assert(log_count == 4 && delivered == 0);
+
+    // The first new confirmed gesture after idle reaches the application.
+    poll_pad(600, period_us);
+    poll_pad(600, BSP_BTN_CONFIRM_MS * 1000LL);
+    assert(s_decoder.locked == BSP_BTN_OK);
+    fire(BSP_BTN_OK, BUTTON_PRESS_DOWN);
+    assert(delivered == 1);
+}
 int main(void) {
     for (int i = 1; i <= BSP_BTN_COUNT; ++i) {
         reset_faults(); fail_create = i;
@@ -403,6 +497,7 @@ int main(void) {
     check_voltage(447, BSP_BTN_OK); check_voltage(1899, BSP_BTN_OK);
     check_voltage(1900, -1); check_voltage(3300, -1);
     assert(bsp_button_read_mv() == 3300);
+    check_key_lock();
     fail_read = 1; clock_us += 2000;
     for (int i = 0; i < BSP_BTN_COUNT; ++i) assert(!button_level(&s_drivers[i].base));
     assert(bsp_button_read_mv() == -1);
@@ -430,6 +525,7 @@ int main(void) {
     check_invalid_and_bounce();
     check_ladder_handoff();
     check_second_key_before_first_end();
+    check_key_lock_with_wake_guard();
     assert(button_cleanup() == ESP_OK); assert_clean();
-    puts("BSP button fault-injection and wake-gesture tests: PASS");
+    puts("BSP button fault-injection, key-lock, and wake-gesture tests: PASS");
 }
