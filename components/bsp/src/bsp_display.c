@@ -9,8 +9,10 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_log.h"
+#include "esp_rom_gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <stdlib.h>
 
 static const char *TAG = "bsp_disp";
 
@@ -18,6 +20,7 @@ static esp_lcd_panel_handle_t    s_panel;
 static esp_lcd_panel_io_handle_t s_io;
 static bool                      s_bus_ready;
 static bool                      s_bl_ready;
+static bool                      s_bl_channel_active;
 static bool                      s_ready;
 
 static const gpio_num_t s_deep_sleep_pins[] = {
@@ -28,31 +31,45 @@ static const uint8_t s_deep_sleep_levels[] = {
     1, 0, 0, 0, 0,
 };
 
+static esp_err_t configure_safe_gpio_output(gpio_num_t pin, uint8_t level) {
+    if ((int)pin < 0) return ESP_OK;
+    // esp_sleep_startup_init 会默认给全引脚打开 slp_sel=1（light sleep 期间浮空断输出）。
+    // 背光脚必须禁用 slp_sel，防止初始化 vTaskDelay(100ms) 或息屏期间自动进入轻睡导致 GPIO21 浮空闪亮。
+    if (pin == BSP_LCD_BL) {
+        (void)gpio_sleep_sel_dis(pin);
+    }
+    // 先将 IO_MUX 切到 GPIO 功能并锁存目标电平，再让 gpio_config 开启输出，
+    // 防止 gpio_output_enable 在切出 U0TXD 前产生高电平毛刺。
+    esp_rom_gpio_pad_select_gpio((uint32_t)pin);
+    esp_err_t e = gpio_set_level(pin, level);
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << (unsigned)pin,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    if (e == ESP_OK) e = gpio_config(&cfg);
+    if (e == ESP_OK) e = gpio_set_level(pin, level);
+    return e;
+}
+
 static esp_err_t display_set_safe_levels(void) {
     esp_err_t first_error = ESP_OK;
     for (size_t i = 0; i < sizeof(s_deep_sleep_pins) /
                            sizeof(s_deep_sleep_pins[0]); i++) {
-        gpio_num_t pin = s_deep_sleep_pins[i];
-        if ((int)pin < 0) continue;
-        gpio_config_t cfg = {
-            .pin_bit_mask = 1ULL << (unsigned)pin,
-            .mode = GPIO_MODE_OUTPUT,
-            .pull_up_en = GPIO_PULLUP_DISABLE,
-            .pull_down_en = GPIO_PULLDOWN_DISABLE,
-            .intr_type = GPIO_INTR_DISABLE,
-        };
-        esp_err_t e = gpio_config(&cfg);
-        if (e == ESP_OK) e = gpio_set_level(pin, s_deep_sleep_levels[i]);
+        esp_err_t e = configure_safe_gpio_output(s_deep_sleep_pins[i],
+                                                 s_deep_sleep_levels[i]);
         if (e != ESP_OK && first_error == ESP_OK) first_error = e;
     }
     return first_error;
 }
 
-// deep-sleep hold 可跨 reset 保留。先禁用全局 deep hold，在单引脚 hold
-// 仍生效时写入与休眠期一致的安全值，再解锁各引脚，避免唤醒瞬间毛刺。
+// deep-sleep hold 可跨 reset 保留。先在硬件保持仍生效时配置安全 GPIO 电平与 IO_MUX
+// （避免 GPIO21 露出默认 U0TXD 高电平），再禁用全局和单引脚 hold，消除唤醒瞬间闪屏。
 static esp_err_t display_release_deep_sleep_holds(void) {
-    gpio_deep_sleep_hold_dis();
     esp_err_t first_error = display_set_safe_levels();
+    gpio_deep_sleep_hold_dis();
     for (size_t i = 0; i < sizeof(s_deep_sleep_pins) /
                            sizeof(s_deep_sleep_pins[0]); i++) {
         gpio_num_t pin = s_deep_sleep_pins[i];
@@ -61,6 +78,22 @@ static esp_err_t display_release_deep_sleep_holds(void) {
         if (e != ESP_OK && first_error == ESP_OK) first_error = e;
     }
     return first_error;
+}
+
+void bsp_display_backlight_early_off(void) {
+    if (BSP_LCD_BL < 0 || s_bl_ready) return;
+    (void)configure_safe_gpio_output(BSP_LCD_BL, 0);
+}
+
+void bsp_display_hold_sleep_levels(void) {
+    (void)display_set_safe_levels();
+    for (size_t i = 0; i < sizeof(s_deep_sleep_pins) /
+                           sizeof(s_deep_sleep_pins[0]); i++) {
+        gpio_num_t pin = s_deep_sleep_pins[i];
+        if ((int)pin < 0) continue;
+        (void)gpio_hold_en(pin);
+    }
+    gpio_deep_sleep_hold_en();
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +134,7 @@ static const st_init_cmd_t ST7789P3_CMDS[] = {
 
 static esp_err_t backlight_init(void) {
     if (BSP_LCD_BL < 0) { ESP_LOGW(TAG, "背光引脚未接 MCU,亮度不可调"); return ESP_OK; }
+    bsp_display_backlight_early_off();
     ledc_timer_config_t t = {
         .speed_mode      = BSP_BL_LEDC_MODE,
         .timer_num       = BSP_BL_LEDC_TIMER,
@@ -112,25 +146,26 @@ static esp_err_t backlight_init(void) {
     esp_err_t e = ledc_timer_config(&t);
     if (e != ESP_OK) { ESP_LOGE(TAG, "ledc_timer_config 失败: %s", esp_err_to_name(e)); return e; }
 
-    ledc_channel_config_t ch = {
-        .gpio_num   = BSP_LCD_BL,
-        .speed_mode = BSP_BL_LEDC_MODE,
-        .channel    = BSP_BL_LEDC_CHANNEL,
-        .timer_sel  = BSP_BL_LEDC_TIMER,
-        .duty       = 0,
-        .hpoint     = 0,
-        .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,
-    };
-    e = ledc_channel_config(&ch);
-    if (e != ESP_OK) {
-        ESP_LOGE(TAG, "ledc_channel_config 失败: %s", esp_err_to_name(e));
-        ledc_timer_rst(BSP_BL_LEDC_MODE, BSP_BL_LEDC_TIMER);
-        return e;
-    }
-
+    // 仅先配置定时器，通道延迟到首次非零亮度设置时绑定，确保初始化期 GPIO21 始终为纯 GPIO 低电平。
+    s_bl_channel_active = false;
     s_bl_ready = true;
     ESP_LOGI(TAG, "背光 LEDC 就绪 gpio=%d", BSP_LCD_BL);
     return ESP_OK;
+}
+
+static void clear_panel_gram(esp_lcd_panel_handle_t panel) {
+    const int strip_rows = 8;
+    uint16_t *zeros = calloc((size_t)BSP_LCD_W * (size_t)strip_rows, sizeof(uint16_t));
+    if (!zeros) return;
+    for (int y = 0; y < BSP_LCD_H; y += strip_rows) {
+        int y_end = y + strip_rows;
+        if (y_end > BSP_LCD_H) y_end = BSP_LCD_H;
+        if (esp_lcd_panel_draw_bitmap(panel, 0, y, BSP_LCD_W, y_end, zeros) != ESP_OK) break;
+    }
+    // esp_lcd_panel_disp_on_off 内部发命令时会等待已排队的 SPI 事务完成，
+    // 为保证 DMA 期间缓冲有效，在调用 disp_on_off 之后再释放。
+    (void)esp_lcd_panel_disp_on_off(panel, false);
+    free(zeros);
 }
 
 esp_err_t bsp_display_init(void) {
@@ -199,6 +234,7 @@ esp_err_t bsp_display_init(void) {
     if (e != ESP_OK) { ESP_LOGE(TAG, "面板镜像设置失败: %s", esp_err_to_name(e)); goto fail; }
     e = esp_lcd_panel_set_gap(s_panel, 0, 0);
     if (e != ESP_OK) { ESP_LOGE(TAG, "面板偏移设置失败: %s", esp_err_to_name(e)); goto fail; }
+    clear_panel_gram(s_panel);
     e = esp_lcd_panel_disp_on_off(s_panel, true);                    // 0x29 DISPON
     if (e != ESP_OK) { ESP_LOGE(TAG, "面板显示开启失败: %s", esp_err_to_name(e)); goto fail; }
 
@@ -226,6 +262,7 @@ fail:
         else ESP_LOGE(TAG, "SPI 总线回滚失败: %s", esp_err_to_name(cleanup));
     }
     s_bl_ready = false;
+    s_bl_channel_active = false;
     return e;
 }
 
@@ -234,37 +271,65 @@ esp_lcd_panel_handle_t bsp_display_panel(void) { return s_panel; }
 esp_lcd_panel_io_handle_t bsp_display_io(void) { return s_io; }
 
 void bsp_display_backlight(uint8_t percent) {
-    if (!s_bl_ready) return;
+    if (!s_bl_ready || BSP_LCD_BL < 0) return;
+    if (percent == 0) {
+        if (s_bl_channel_active) {
+            (void)ledc_set_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, 0);
+            (void)ledc_update_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL);
+            (void)ledc_stop(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, 0);
+            s_bl_channel_active = false;
+        }
+        (void)configure_safe_gpio_output(BSP_LCD_BL, 0);
+        return;
+    }
     if (percent > 100) percent = 100;
     uint32_t max_duty = (1u << BSP_BL_LEDC_RES) - 1u;
     uint32_t duty = (max_duty * percent) / 100u;
+    if (!s_bl_channel_active) {
+        ledc_channel_config_t ch = {
+            .gpio_num   = BSP_LCD_BL,
+            .speed_mode = BSP_BL_LEDC_MODE,
+            .channel    = BSP_BL_LEDC_CHANNEL,
+            .timer_sel  = BSP_BL_LEDC_TIMER,
+            .duty       = duty,
+            .hpoint     = 0,
+            .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,
+        };
+        if (ledc_channel_config(&ch) != ESP_OK) {
+            ESP_LOGE(TAG, "ledc_channel_config 失败");
+            return;
+        }
+        s_bl_channel_active = true;
+        return;
+    }
     ledc_set_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, duty);
     ledc_update_duty(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL);
 }
 
 esp_err_t bsp_display_prepare_deep_sleep(void) {
     esp_err_t first_error = ESP_OK;
+    if (s_bl_ready && BSP_LCD_BL >= 0 && s_bl_channel_active) {
+        esp_err_t e = ledc_stop(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, 0);
+        if (e != ESP_OK) {
+            ESP_LOGE(TAG, "LCD 背光 PWM 停止失败: %s", esp_err_to_name(e));
+            first_error = e;
+        }
+        s_bl_channel_active = false;
+    }
+    bsp_display_backlight(0);
+
     if (!s_ready || !s_panel) {
-        first_error = ESP_ERR_INVALID_STATE;
+        if (first_error == ESP_OK) first_error = ESP_ERR_INVALID_STATE;
         ESP_LOGE(TAG, "LCD 未就绪，无法发送 deep-sleep 命令");
     } else {
         esp_err_t e = esp_lcd_panel_disp_on_off(s_panel, false);
         if (e != ESP_OK) {
             ESP_LOGE(TAG, "ST7789 关闭显示失败: %s", esp_err_to_name(e));
-            first_error = e;
+            if (first_error == ESP_OK) first_error = e;
         }
         e = esp_lcd_panel_disp_sleep(s_panel, true);
         if (e != ESP_OK) {
             ESP_LOGE(TAG, "ST7789 Sleep In 失败: %s", esp_err_to_name(e));
-            if (first_error == ESP_OK) first_error = e;
-        }
-    }
-
-    bsp_display_backlight(0);
-    if (s_bl_ready && BSP_LCD_BL >= 0) {
-        esp_err_t e = ledc_stop(BSP_BL_LEDC_MODE, BSP_BL_LEDC_CHANNEL, 0);
-        if (e != ESP_OK) {
-            ESP_LOGE(TAG, "LCD 背光 PWM 停止失败: %s", esp_err_to_name(e));
             if (first_error == ESP_OK) first_error = e;
         }
     }

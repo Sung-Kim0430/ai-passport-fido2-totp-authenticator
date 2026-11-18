@@ -32,6 +32,8 @@
 #include "esp_rtc_time.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
+#include "soc/io_mux_reg.h"
+#include "soc/rtc_cntl_reg.h"
 #include "nvs_flash.h"
 #include "esp_pm.h"
 #include "lvgl.h"
@@ -1410,10 +1412,14 @@ static void init_power_management(void)
 void app_main(void)
 {
     const bool clock_deep_wakeup = esp_reset_reason() == ESP_RST_DEEPSLEEP;
+    const uint32_t early_dig_hold = REG_READ(RTC_CNTL_DIG_PAD_HOLD_REG);
+    const uint32_t early_dig_iso = REG_READ(RTC_CNTL_DIG_ISO_REG);
+    const uint32_t early_io21_mux = REG_READ(IO_MUX_GPIO21_REG);
     key_guard_arm(&s_key_guard);
     const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
     const bool timer_only = clock_deep_wakeup && wake_causes == (1U << ESP_SLEEP_WAKEUP_TIMER);
     const bool observer_ready = timer_only && clock_key_observer_begin();
+    bsp_display_backlight_early_off();
 
     /* 0. NVS Flash initialization */
     esp_err_t nvs_err = nvs_flash_init();
@@ -1430,13 +1436,22 @@ void app_main(void)
         auth_time_init(false);
         ESP_LOGW(TAG, "RTC continuation untrusted; time synchronization required");
     }
+    if (timer_only) {
+        bsp_display_hold_sleep_levels();
+    }
     clock_maintenance_try(timer_only, observer_ready);
     clock_key_observer_end();
     rtc_clock_begin_normal_wake();
 
+    auth_storage_lab_load(&s_lab_cfg);
+    esp_log_level_set("*", s_lab_cfg.console_log_enabled ? ESP_LOG_INFO : ESP_LOG_NONE);
+
     ESP_LOGI(TAG, "Starting FoloToy AI Passport FIDO8TOTP Authenticator...");
     ESP_LOGI(TAG, "Reset reason: %d, free heap: %u",
              (int)esp_reset_reason(), (unsigned)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Early wake hold: causes=0x%lx dig_hold=0x%08lx dig_iso=0x%08lx io21_mux=0x%08lx",
+             (unsigned long)wake_causes, (unsigned long)early_dig_hold,
+             (unsigned long)early_dig_iso, (unsigned long)early_io21_mux);
 
     /* 启动数值诊断：检查点不是完整睡眠或全路径盲区实测。 */
     const rtc_clock_diagnostics_t clock_diag = rtc_clock_diagnostics();
@@ -1462,13 +1477,11 @@ void app_main(void)
         ESP_LOGE(TAG, "Cannot load or migrate account storage; original data was preserved");
         return;
     }
-    auth_storage_lab_load(&s_lab_cfg);
     if (!auth_storage_totp_view_load(&s_totp_view))
         ESP_LOGW(TAG, "Display preference unavailable; using card view");
     if (!auth_wifi_init_identity()) {
         ESP_LOGE(TAG, "Unable to read chip identity; Wi-Fi AP will remain unavailable");
     }
-    esp_log_level_set("*", s_lab_cfg.console_log_enabled ? ESP_LOG_INFO : ESP_LOG_NONE);
 
     /* 5. Audio */
     if (bsp_audio_init() == ESP_OK) {
@@ -1529,7 +1542,8 @@ void app_main(void)
     ESP_LOGI(TAG, "LVGL pool free=%u largest=%u", (unsigned)ui_memory.free_size,
              (unsigned)ui_memory.free_biggest_size);
 
-    /* 11. Now that the lock screen is cleanly rendered in ST7789 GRAM, turn on backlight smoothly */
+    /* 11. Wait briefly so the final SPI DMA chunk settles in ST7789 GRAM before lighting backlight */
+    vTaskDelay(pdMS_TO_TICKS(20));
     bsp_display_backlight(s_cfg.brightness);
 
     /* 12. BLE Peripheral & FIDO GATT Service (opt-in via Lab) */
