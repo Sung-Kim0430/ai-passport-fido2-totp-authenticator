@@ -15,7 +15,7 @@ int main(void)
         30001, 200, 40000, &r));
     assert(r.hrt_us == 20000 && r.utc_us == 1700000000123456ULL);
     assert(r.reference_id == (UINT64_C(0x12345678) << 32 | p.id));
-    assert(r.transport_uncertainty_us == 6201 && r.phone_uncertainty_us == 1000000);
+    assert(r.transport_uncertainty_us == 6201 && r.phone_uncertainty_us == 250000);
     assert(auth_time_sync_resolve(&cache, p.id, r.utc_us, 30001, 200, 5020000, &r));
     assert(!auth_time_sync_resolve(&cache, p.id, r.utc_us, 30001, 200, 5020001, &r));
     assert(!auth_time_sync_resolve(&cache, p.id, r.utc_us, 30001, 200, 19999, &r));

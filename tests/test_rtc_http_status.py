@@ -176,8 +176,8 @@ int main(void) {
     assert(status_code==202 && queued.time_reference_precise && queued.time_reference_quality);
     assert(queued.time_reference_hrt_us==92500);
     assert(queued.time_reference_transport_uncertainty_us==18701);
-    assert(queued.time_reference_phone_uncertainty_us==1000000);
-    assert(queued.time_reference_uncertainty_us==1018701);
+    assert(queued.time_reference_phone_uncertainty_us==250000);
+    assert(queued.time_reference_uncertainty_us==268701);
     dispatch(); assert(status_code==400); /* No legacy fallback on replay. */
     precise=auth_time_sync_record(&s_precise_time_probes,90000,95000);
     fixture(precise.id); fields[6]=(cJSON){"reference_version",NULL,2,2};

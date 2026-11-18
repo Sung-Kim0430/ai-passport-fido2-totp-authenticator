@@ -307,3 +307,14 @@ bool rtc_clock_platform_arm(bool request_maintenance)
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     return false;
 }
+
+bool rtc_clock_platform_arm_interval(uint64_t interval_us)
+{
+#if CONFIG_AUTH_RTC_MAINTENANCE
+    esp_set_deep_sleep_wake_stub(esp_wake_deep_sleep);
+    if (interval_us && esp_sleep_enable_timer_wakeup(interval_us) == ESP_OK) return true;
+#else
+    (void)interval_us;
+#endif
+    return rtc_clock_platform_arm(false);
+}

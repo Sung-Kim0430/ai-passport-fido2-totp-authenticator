@@ -249,6 +249,7 @@ int esp_sleep_disable_wakeup_source(int source) {
 bool rtc_clock_stub_install(void) { ++installs; if (stub_ok) entry = old_stub; return stub_ok; }
 '''
         code += "bool rtc_clock_platform_arm(bool request_maintenance) {\n" + function_body(platform, "rtc_clock_platform_arm") + "\n}\n"
+        code += "bool rtc_clock_platform_arm_interval(uint64_t interval_us) {\n" + function_body(platform, "rtc_clock_platform_arm_interval") + "\n}\n"
         code += r'''
 static void reset(void) {
     wake_sources = GPIO_WAKE | ESP_SLEEP_WAKEUP_TIMER;
@@ -265,6 +266,12 @@ int main(void) {
     assert(entry == esp_wake_deep_sleep && restores > 0 && installs == 0);
     assert(enables == 1 && interval == UINT64_C(900000000) && disables == 0);
     assert(wake_sources == (GPIO_WAKE | ESP_SLEEP_WAKEUP_TIMER));
+    reset();
+    assert(rtc_clock_platform_arm_interval(UINT64_C(120000000)));
+    assert(enables == 1 && interval == UINT64_C(120000000) && disables == 0);
+    reset();
+    assert(!rtc_clock_platform_arm_interval(0));
+    assert(wake_sources == GPIO_WAKE && disables == 1 && enables == 0);
     reset(); enable_error = ESP_FAIL;
     assert(!rtc_clock_platform_arm(true));
     assert(entry == esp_wake_deep_sleep && restores > 0 && installs == 0);
@@ -279,6 +286,9 @@ int main(void) {
     assert(!rtc_clock_platform_arm(true));
     assert(entry == esp_wake_deep_sleep && restores > 0 && installs == 0 && enables == 0);
     assert(wake_sources == GPIO_WAKE && disables == 1);
+    reset();
+    assert(!rtc_clock_platform_arm_interval(UINT64_C(120000000)));
+    assert(wake_sources == GPIO_WAKE && disables == 1 && enables == 0);
 #endif
     return 0;
 }

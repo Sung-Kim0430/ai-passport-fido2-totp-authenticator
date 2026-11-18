@@ -103,7 +103,15 @@ bool rtc_clock_platform_save(const rtc_drift_model_t *model) {
     store_state = RTC_CLOCK_STORE_VALID;
     return true;
 }
-bool rtc_clock_platform_arm(bool requested) { return requested; }
+static uint64_t armed_interval_us;
+bool rtc_clock_platform_arm(bool requested) {
+    armed_interval_us = requested ? RTC_CLOCK_STEADY_WAKE_US : 0;
+    return requested;
+}
+bool rtc_clock_platform_arm_interval(uint64_t interval_us) {
+    armed_interval_us = interval_us;
+    return interval_us > 0;
+}
 
 static uint8_t history_blobs[13][832];
 static size_t history_sizes[13];
@@ -176,6 +184,7 @@ static void reset_all(void) {
     memset(&light_snapshot, 0, sizeof light_snapshot);
     light_period = 0;
     light_inhibited = light_start_fail = false;
+    armed_interval_us = 0;
     memset(&stored_model, 0, sizeof stored_model);
 }
 static int64_t prepare_session(void) {
@@ -613,11 +622,12 @@ static void check_learning_and_coefficient_budget(void) {
         assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
     }
     rtc_clock_diagnostics_t d = rtc_clock_diagnostics();
-    assert(!d.ppm_qualified && d.ppm == 0 && d.learning_reason == RTC_DRIFT_LEARN_PUBLISHED);
+    assert(d.ppm_qualified && d.ppm == 2000 && d.learning_reason == RTC_DRIFT_LEARN_PUBLISHED);
     assert(rtc_clock_retained.accounting.learning.ppm == 2000 && rtc_clock_retained.accounting.learning.qualified);
     rtc_clock_tick();
     assert(coefficient_saves == 0);
     assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    assert(armed_interval_us == RTC_CLOCK_COOLDOWN_WAKE_US);
     ticks += UINT64_C(14428800000);
     uptime_us = 3000;
     reboot_runtime();
@@ -627,27 +637,28 @@ static void check_learning_and_coefficient_budget(void) {
     assert(rtc_clock_prepare_maintenance());
     rtc_clock_tick();
     assert(rtc_clock_commit_sleep(true));
+    assert(armed_interval_us == RTC_CLOCK_STEADY_WAKE_US);
     assert(reads == old_reads && saves == old_saves && measures == old_measures + 1);
     assert(coefficient_saves == 0);
     assert(rtc_clock_abort_sleep());
     fail_coefficient_save = true;
     rtc_clock_tick();
-    assert(coefficient_saves == 0);
+    assert(coefficient_saves == 1 && stored_ppm == 0);
     rtc_clock_tick();
-    assert(coefficient_saves == 0);
+    assert(coefficient_saves == 1 && stored_ppm == 0);
     advance_fake(INT64_C(86400) * 1000000 - 1);
     rtc_clock_tick();
-    assert(coefficient_saves == 0);
+    assert(coefficient_saves == 1 && stored_ppm == 0);
     advance_fake(60000001);
     fail_coefficient_save = false;
     rtc_clock_tick();
-    assert(coefficient_saves == 0 && stored_ppm == 0);
+    assert(coefficient_saves == 2 && stored_ppm == 2000);
     advance_fake(INT64_C(86400) * 1000000);
     rtc_clock_tick();
-    assert(coefficient_saves == 0);
+    assert(coefficient_saves == 2 && stored_ppm == 2000);
     reboot_runtime();
     assert(rtc_clock_boot(false, false) == RTC_CLOCK_BASELINE);
-    assert(!rtc_clock_diagnostics().ppm_qualified && rtc_clock_diagnostics().ppm == 0);
+    assert(rtc_clock_diagnostics().ppm_qualified && rtc_clock_diagnostics().ppm == 2000);
     assert(!rtc_clock_retained.accounting.learning.baseline_valid);
 }
 
@@ -1177,7 +1188,7 @@ static void check_history_shadow_reload_and_age(void) {
     rtc_clock_tick();
     view = rtc_clock_history_owner_summary();
     assert(view.shadow.result == RTC_HISTORY_ESTIMATE_PENDING && view.shadow.samples == 0);
-    assert(view.active_ppm == -870 && stored_ppm == -870);
+    assert(view.active_ppm == 2000 && stored_ppm == 2000);
 }
 
 static void simulate_light_sleep(uint64_t duration_us) {
@@ -1327,6 +1338,65 @@ static void check_light_sleep_sdk_libc_offset(void) {
     assert(sets == old_sets);
 }
 
+static void check_sub10ppm_save_and_30day_convergence(void) {
+    reset_all();
+    coefficient_store = RTC_CLOCK_STORE_VALID;
+    stored_ppm = 1998;
+    rtc_clock_boot(false, false);
+    rtc_clock_begin_normal_wake();
+    rtc_clock_retained.accounting.active_ppm = 2000;
+    rtc_clock_retained.accounting.coefficient_budget_us = RTC_CLOCK_SAVE_INTERVAL_US;
+    seal_accounting();
+    rtc_clock_tick();
+    assert(coefficient_saves == 1 && stored_ppm == 2000);
+
+    /* Unseeded board converging within <= 5s over 30 days under +15 ppm XO error. */
+    reset_all();
+    rtc_clock_boot(false, false);
+    rtc_clock_begin_normal_wake();
+    const int32_t true_ppm = 15;
+    uint64_t utc = (uint64_t)wall_us;
+    uint64_t ref_id = 1;
+    rtc_clock_reference_t ref = reference_now(ref_id++, utc);
+    ref.uncertainty_us = 255000;
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+
+    /* Sync windows: 12h, then 3d, then 3d -> promotes & refines active_ppm via holdout. */
+    const uint64_t sync_gaps_s[] = { 12 * 3600, 3 * 86400, 3 * 86400 };
+    for (size_t i = 0; i < sizeof(sync_gaps_s) / sizeof(sync_gaps_s[0]); ++i) {
+        const uint64_t gap_us = sync_gaps_s[i] * UINT64_C(1000000);
+        assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+        assert(armed_interval_us == RTC_CLOCK_COOLDOWN_WAKE_US);
+        ticks += (gap_us * (uint64_t)(1000000 + true_ppm) / UINT64_C(1000000)) / 3;
+        utc += gap_us;
+        uptime_us = 3000;
+        reboot_runtime();
+        assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+        rtc_clock_begin_normal_wake();
+        advance_fake(60000);
+        utc += 60000;
+        ref = reference_now(ref_id++, utc);
+        ref.uncertainty_us = 255000;
+        assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+        rtc_clock_tick();
+    }
+    assert(rtc_clock_diagnostics().ppm_qualified && rtc_clock_diagnostics().ppm == true_ppm);
+
+    /* Simulate 30 days of sleep across cooldown + maintenance wakes with no phone syncs. */
+    const uint64_t total_sleep_us = UINT64_C(30) * 86400 * 1000000;
+    const uint64_t step_us = UINT64_C(6) * 3600 * 1000000;
+    for (uint64_t done = 0; done < total_sleep_us; done += step_us) {
+        assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+        ticks += (step_us * (uint64_t)(1000000 + true_ppm) / UINT64_C(1000000)) / 3;
+        utc += step_us;
+        uptime_us = 3000;
+        reboot_runtime();
+        assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+    }
+    const int64_t err_us = wall_us - (int64_t)utc;
+    assert(err_us >= -5000000 && err_us <= 5000000);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         if (!strcmp(argv[1], "init")) check_history_init_recovery();
@@ -1379,6 +1449,7 @@ int main(int argc, char **argv) {
     check_storage_budget_and_failure();
     check_capture_skew_and_retry();
     check_rejected_old_period_is_not_restored();
+    check_sub10ppm_save_and_30day_convergence();
     puts("RTC adapter UTC, lifecycle, security isolation and storage budget: PASS");
     return 0;
 }

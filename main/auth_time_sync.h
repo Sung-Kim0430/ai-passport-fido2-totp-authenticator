@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define AUTH_TIME_SYNC_PROBES 16
-#define AUTH_TIME_SYNC_PHONE_UNCERTAINTY_US UINT64_C(1000000)
+#define AUTH_TIME_SYNC_PHONE_UNCERTAINTY_US UINT64_C(250000)
 
 /* HTTP-task-owned, independent of the legacy status-probe cache. */
 typedef struct {

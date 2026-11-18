@@ -9,6 +9,8 @@
 #define RTC_CLOCK_VERSION UINT32_C(3)
 #define RTC_CLOCK_MODEL_VERSION UINT32_C(1)
 #define RTC_CLOCK_SAVE_INTERVAL_US (UINT64_C(86400) * 1000000)
+#define RTC_CLOCK_COOLDOWN_WAKE_US (UINT64_C(120) * 1000000)
+#define RTC_CLOCK_STEADY_WAKE_US (UINT64_C(900) * 1000000)
 #define RTC_CLOCK_MAINTENANCE_US (UINT64_C(300) * 1000000)
 
 typedef enum {
@@ -114,6 +116,7 @@ bool rtc_clock_platform_save(const rtc_drift_model_t *model);
 rtc_clock_store_result_t rtc_clock_platform_load_coefficient(int32_t *ppm);
 bool rtc_clock_platform_save_coefficient(int32_t ppm);
 bool rtc_clock_platform_arm(bool request_maintenance);
+bool rtc_clock_platform_arm_interval(uint64_t interval_us);
 bool rtc_clock_stub_install(void);
 
 /* 会话校验函数只做整数运算；最终固件还必须审计实际 RTC/ROM 调用图。 */

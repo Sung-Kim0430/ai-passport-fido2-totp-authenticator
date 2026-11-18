@@ -189,6 +189,8 @@ static bool history_reconcile(void)
     return true;
 }
 
+static void seal_accounting(void);
+
 static void history_refresh(void)
 {
     rtc_history_estimate_t estimate = {0};
@@ -200,6 +202,23 @@ static void history_refresh(void)
             rtc_clock_retained.accounting.active_ppm, &s_clock.history->workspace, &estimate);
     }
     s_clock.history_shadow = estimate;
+    rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
+    if (s_clock.boot_done && s_clock.supported && rtc_clock_platform_source() == s_clock.source &&
+        estimate.result == RTC_HISTORY_ESTIMATE_READY && estimate.inliers >= 2 && isfinite(estimate.ppm)) {
+        const long long rounded = llround(estimate.ppm);
+        if (rounded >= -20000 && rounded <= 20000) {
+            const int32_t candidate = (int32_t)rounded;
+            const bool initial = !a->active_qualified && estimate.uncertainty_ppm <= 100.0;
+            const bool refine = a->active_qualified && estimate.holdout_improved && candidate != a->active_ppm;
+            if (initial || refine) {
+                a->active_ppm = candidate;
+                a->active_qualified = 1;
+                a->learning.ppm = candidate;
+                a->learning.qualified = true;
+                seal_accounting();
+            }
+        }
+    }
 }
 
 static void history_open(void)
@@ -715,7 +734,7 @@ static void checkpoint_coefficient(void)
     const int32_t change = ppm - s_clock.saved_ppm;
     if (!s_clock.coefficient_blocked && a->active_qualified &&
         a->coefficient_budget_us >= RTC_CLOCK_SAVE_INTERVAL_US &&
-        (!s_clock.coefficient_saved || change >= 10 || change <= -10)) {
+        (!s_clock.coefficient_saved || change != 0)) {
         a->coefficient_budget_us = 0;
         if (rtc_clock_platform_save_coefficient(ppm)) {
             s_clock.saved_ppm = ppm;
@@ -735,15 +754,17 @@ void rtc_clock_tick(void)
         return;
     }
     history_start();
-    checkpoint_coefficient();
+    advance_budget(rtc_clock_platform_uptime_us());
     history_checkpoint();
     const int64_t now = rtc_clock_platform_uptime_us();
-    if (now < s_clock.next_sample_us) return;
-    s_clock.next_sample_us = now + 60000000;
-    history_refresh();
-    read_temperature(now);
-    measure_period();
-    checkpoint_model();
+    if (now >= s_clock.next_sample_us) {
+        s_clock.next_sample_us = now + 60000000;
+        history_refresh();
+        read_temperature(now);
+        measure_period();
+        checkpoint_model();
+    }
+    checkpoint_coefficient();
 }
 
 bool rtc_clock_prepare_sleep(void)
@@ -808,8 +829,10 @@ bool rtc_clock_commit_sleep(bool time_trusted)
     else if (time_trusted) next.fault = RTC_CLOCK_FAULT_CAPTURE;
     next.magic = RTC_CLOCK_MAGIC;
     next.version = RTC_CLOCK_VERSION;
-    next.maintenance_enabled = rtc_clock_platform_arm(captured && s_clock.supported &&
-        !rtc_clock_retained.maintenance_blocked);
+    const bool arm_maintenance = captured && s_clock.supported && !rtc_clock_retained.maintenance_blocked;
+    next.maintenance_enabled = arm_maintenance ? rtc_clock_platform_arm_interval(
+        s_clock.maintenance ? RTC_CLOCK_STEADY_WAKE_US : RTC_CLOCK_COOLDOWN_WAKE_US) :
+        rtc_clock_platform_arm(false);
     if (s_clock.maintenance && a->maintenance_count != UINT32_MAX) ++a->maintenance_count;
     rtc_clock_session_seal(&next);
     rtc_clock_retained.session = next;
@@ -1037,8 +1060,14 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
     if (!rtc_clock_platform_set_wall_us(target)) return RTC_CLOCK_REFERENCE_FAILED;
     const int64_t after = rtc_clock_platform_uptime_us();
     const bool checked = after >= before && after - before <= CLOCK_CAPTURE_MAX_US;
-    if (checked) s_clock.light_needs_sync = false;
-    if (checked) rtc_clock_retained.accounting = next;
+    if (checked) {
+        if (eligible && !next.active_qualified && next.learning.qualified) {
+            next.active_ppm = next.learning.ppm;
+            next.active_qualified = 1;
+        }
+        s_clock.light_needs_sync = false;
+        rtc_clock_retained.accounting = next;
+    }
     if (checked && capture_history) {
         rtc_clock_history_retained_t *h = &rtc_clock_retained.history;
         ++h->accepted_sequence;

@@ -221,7 +221,7 @@ async function historyTests() {
   for(const secret of ['SECRET','PRIVATE','session','account','device_id','epoch'])assert.equal(JSON.stringify(saved).includes(secret),false);
   assert.match(elements.get('rtcSummary').textContent,/无新增睡眠证据/);
   assert.match(elements.get('rtcSummary').textContent,/未持久化/);
-  assert.match(elements.get('rtcSummary').textContent,/READY（仅诊断，未激活）/);
+  assert.match(elements.get('rtcSummary').textContent,/多窗口估计 READY/);
   setup(100,(p,c)=>{if(c)throw new Error('409 stale');});saved=undefined;
   await run('rtcHistoryAction(true)');assert.equal(saved,undefined);assert.match(elements.get('error').textContent,/409 stale/);
   context.URL=URL;
