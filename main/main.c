@@ -297,7 +297,9 @@ static void auth_enter_view(auth_view_t view)
     if (view != AUTH_VIEW_SETTINGS) s_wipe_confirm = false;
     if (view != AUTH_VIEW_LAB) s_fido_reset_confirm = false;
     if (view != AUTH_VIEW_FIDO_ACCOUNTS) s_fido_acc_confirm = false;
-    if (auth_ui_get_view() == AUTH_VIEW_CHANGE_PASSCODE && view != AUTH_VIEW_CHANGE_PASSCODE) {
+    if (auth_ui_get_view() == AUTH_VIEW_CHANGE_PASSCODE &&
+        view != AUTH_VIEW_CHANGE_PASSCODE &&
+        view != AUTH_VIEW_FIDO_PROMPT) {
         passcode_guard_init(&s_guard, s_cfg.passcode_pattern, s_cfg.passcode_len);
     }
     ui_lock();
@@ -1304,6 +1306,7 @@ static void auth_app_task(void *param)
                             sound_fail();
                             refresh_display();
                             vTaskDelay(pdMS_TO_TICKS(1200));
+                            s_ignore_key_before_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
                             auth_enter_view(AUTH_VIEW_SETTINGS);
                             continue;
                         }

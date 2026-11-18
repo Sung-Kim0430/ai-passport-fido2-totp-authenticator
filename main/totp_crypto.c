@@ -261,9 +261,16 @@ bool totp_generate_from_base32(const char *base32_secret,
     if (!base32_secret || !out_code) return false;
     uint8_t raw_key[64];
     int decoded_len = totp_base32_decode(base32_secret, raw_key, sizeof(raw_key));
-    if (decoded_len <= 0) return false;
+    if (decoded_len <= 0) {
+        volatile uint8_t *vp = raw_key;
+        for (size_t i = 0; i < sizeof(raw_key); i++) vp[i] = 0;
+        return false;
+    }
 
-    return totp_generate_code(raw_key, (size_t)decoded_len,
-                              current_timestamp, time_step, digits,
-                              out_code, out_seconds_remaining);
+    bool ok = totp_generate_code(raw_key, (size_t)decoded_len,
+                                 current_timestamp, time_step, digits,
+                                 out_code, out_seconds_remaining);
+    volatile uint8_t *vp = raw_key;
+    for (size_t i = 0; i < sizeof(raw_key); i++) vp[i] = 0;
+    return ok;
 }

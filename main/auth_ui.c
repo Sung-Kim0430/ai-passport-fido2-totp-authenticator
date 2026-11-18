@@ -219,19 +219,16 @@ void auth_ui_init(void)
     set_label_text_if_changed(s_lbl_ble_status, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_font(s_lbl_ble_status, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_ble_status, color_text_mut, 0);
-    lv_obj_align(s_lbl_ble_status, LV_ALIGN_CENTER, -10, 0);
 
     s_lbl_wifi_status = lv_label_create(s_top_bar);
     set_label_text_if_changed(s_lbl_wifi_status, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_font(s_lbl_wifi_status, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_wifi_status, color_text_mut, 0);
-    lv_obj_align(s_lbl_wifi_status, LV_ALIGN_CENTER, 20, 0);
 
     s_lbl_battery = lv_label_create(s_top_bar);
     set_label_text_if_changed(s_lbl_battery, LV_SYMBOL_BATTERY_EMPTY " --");
     lv_obj_set_style_text_font(s_lbl_battery, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_battery, color_green, 0);
-    lv_obj_align(s_lbl_battery, LV_ALIGN_RIGHT_MID, -6, 0);
 
     /* --- Bottom Footer Bar (288..320) --- */
     s_bottom_bar = lv_obj_create(s_root_screen);
@@ -262,6 +259,7 @@ void auth_ui_init(void)
     lv_obj_set_style_border_width(s_pnl_lock, 1, 0);
     lv_obj_set_style_radius(s_pnl_lock, 8, 0);
     lv_obj_set_style_pad_all(s_pnl_lock, 6, 0);
+    lv_obj_remove_flag(s_pnl_lock, LV_OBJ_FLAG_SCROLLABLE);
 
     /* Live Clock */
     s_lbl_lock_clock = lv_label_create(s_pnl_lock);
@@ -319,6 +317,7 @@ void auth_ui_init(void)
     lv_obj_set_style_border_width(s_pnl_totp, 1, 0);
     lv_obj_set_style_radius(s_pnl_totp, 8, 0);
     lv_obj_set_style_pad_all(s_pnl_totp, 10, 0);
+    lv_obj_remove_flag(s_pnl_totp, LV_OBJ_FLAG_SCROLLABLE);
 
     s_lbl_totp_index = lv_label_create(s_pnl_totp);
     set_label_text_if_changed(s_lbl_totp_index, "1 / 4");
@@ -336,6 +335,8 @@ void auth_ui_init(void)
 
     s_lbl_totp_account = lv_label_create(s_pnl_totp);
     set_label_text_if_changed(s_lbl_totp_account, "folotoy-dev");
+    lv_obj_set_width(s_lbl_totp_account, 206);
+    lv_label_set_long_mode(s_lbl_totp_account, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_font(s_lbl_totp_account, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(s_lbl_totp_account, color_text_mut, 0);
     lv_obj_align(s_lbl_totp_account, LV_ALIGN_TOP_LEFT, 4, 30);
@@ -373,6 +374,7 @@ void auth_ui_init(void)
     lv_obj_set_style_border_width(s_pnl_fido, 2, 0);
     lv_obj_set_style_radius(s_pnl_fido, 8, 0);
     lv_obj_set_style_pad_all(s_pnl_fido, 10, 0);
+    lv_obj_remove_flag(s_pnl_fido, LV_OBJ_FLAG_SCROLLABLE);
 
     s_lbl_fido_banner = lv_label_create(s_pnl_fido);
     set_label_text_if_changed(s_lbl_fido_banner, "! FIDO AUTH REQUEST !");
@@ -423,6 +425,7 @@ void auth_ui_init(void)
     lv_obj_set_style_border_width(s_pnl_change_pass, 1, 0);
     lv_obj_set_style_radius(s_pnl_change_pass, 8, 0);
     lv_obj_set_style_pad_all(s_pnl_change_pass, 10, 0);
+    lv_obj_remove_flag(s_pnl_change_pass, LV_OBJ_FLAG_SCROLLABLE);
 
     s_lbl_cp_step = lv_label_create(s_pnl_change_pass);
     set_label_text_if_changed(s_lbl_cp_step, "STEP 1: ENTER NEW PIN");
@@ -462,6 +465,7 @@ void auth_ui_init(void)
     lv_obj_set_style_border_width(s_pnl_set_time, 1, 0);
     lv_obj_set_style_radius(s_pnl_set_time, 8, 0);
     lv_obj_set_style_pad_all(s_pnl_set_time, 8, 0);
+    lv_obj_remove_flag(s_pnl_set_time, LV_OBJ_FLAG_SCROLLABLE);
 
     s_lbl_st_title = lv_label_create(s_pnl_set_time);
     set_label_text_if_changed(s_lbl_st_title, "SET DATE & TIME");
@@ -493,6 +497,7 @@ void auth_ui_init(void)
     lv_obj_set_style_border_width(s_pnl_lab, 1, 0);
     lv_obj_set_style_radius(s_pnl_lab, 8, 0);
     lv_obj_set_style_pad_all(s_pnl_lab, 8, 0);
+    lv_obj_remove_flag(s_pnl_lab, LV_OBJ_FLAG_SCROLLABLE);
 
     s_lbl_lab_title = lv_label_create(s_pnl_lab);
     set_label_text_if_changed(s_lbl_lab_title, "LAB / EXPERIMENTS");
@@ -502,6 +507,8 @@ void auth_ui_init(void)
 
     for (int i = 0; i < AUTH_LAB_ITEM_COUNT; i++) {
         s_lbl_lab_items[i] = lv_label_create(s_pnl_lab);
+        lv_obj_set_width(s_lbl_lab_items[i], 206);
+        lv_label_set_long_mode(s_lbl_lab_items[i], LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(s_lbl_lab_items[i], &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(s_lbl_lab_items[i], color_text_pri, 0);
         lv_obj_align(s_lbl_lab_items[i], LV_ALIGN_TOP_LEFT, 6, 36 + i * 30);
@@ -751,8 +758,8 @@ static void apply_totp_layout(auth_totp_view_t mode)
         lv_obj_align(s_lbl_totp_code, LV_ALIGN_CENTER, 0, -10);
         lv_obj_set_style_text_color(s_lbl_totp_seconds, color_cyan, 0);
         lv_obj_align(s_lbl_totp_seconds, LV_ALIGN_BOTTOM_MID, 0, -8);
-        lv_obj_set_width(s_lbl_totp_account, LV_SIZE_CONTENT);
-        lv_label_set_long_mode(s_lbl_totp_account, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(s_lbl_totp_account, 206);
+        lv_label_set_long_mode(s_lbl_totp_account, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(s_lbl_totp_account, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_align(s_lbl_totp_account, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_set_style_text_color(s_lbl_totp_account, color_text_mut, 0);

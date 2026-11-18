@@ -536,7 +536,8 @@ static esp_err_t accounts_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     char prefix[64];
     int prefix_len = snprintf(prefix, sizeof(prefix), "{\"revision\":%lu,\"accounts\":[", (unsigned long)revision);
-    if (httpd_resp_send_chunk(req, prefix, prefix_len) != ESP_OK) return ESP_FAIL;
+    if (prefix_len < 0 || (size_t)prefix_len >= sizeof(prefix) ||
+        httpd_resp_send_chunk(req, prefix, prefix_len) != ESP_OK) return ESP_FAIL;
     for (uint8_t i = 0; i < count; i++) {
         char issuer[AUTH_ISSUER_MAX_LEN * 6], account[AUTH_ACCOUNT_MAX_LEN * 6], item[512];
         if (!json_escape(accounts[i].issuer, issuer, sizeof(issuer)) ||
