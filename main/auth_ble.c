@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
@@ -104,6 +105,9 @@ static volatile bool s_host_stopped = false;
 static volatile bool s_stopping = false;
 static volatile bool s_tick_active = false;
 static portMUX_TYPE s_tick_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE s_pending_lock = portMUX_INITIALIZER_UNLOCKED;
+static StaticSemaphore_t s_tx_mutex_buf;
+static SemaphoreHandle_t s_tx_mutex = NULL;
 static auth_ble_req_cb_t s_req_cb = NULL;
 static TaskHandle_t s_ble_host_task = NULL;
 
@@ -218,8 +222,14 @@ static bool derive_fido_key(const char *rpid, uint8_t out_priv[32],
 /* Fragmented CTAP BLE notification sender */
 static bool ble_send_ctap_frame(uint8_t cmd, const uint8_t *payload, size_t payload_len)
 {
-    if (!s_is_connected || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+    if (s_tx_mutex && xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "CTAP TX mutex timeout");
         return false;
+    }
+
+    bool ok = false;
+    if (!s_is_connected || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        goto out;
     }
 
     uint16_t mtu = ble_att_mtu(s_conn_handle);
@@ -227,7 +237,8 @@ static bool ble_send_ctap_frame(uint8_t cmd, const uint8_t *payload, size_t payl
     size_t max_chunk = mtu - 3;
     if (max_chunk < 20) max_chunk = 20;
 
-    uint8_t buf[1024];
+    uint8_t buf[520];
+    if (max_chunk > sizeof(buf)) max_chunk = sizeof(buf);
     buf[0] = cmd;
     buf[1] = (uint8_t)((payload_len >> 8) & 0xFF);
     buf[2] = (uint8_t)(payload_len & 0xFF);
@@ -242,7 +253,7 @@ static bool ble_send_ctap_frame(uint8_t cmd, const uint8_t *payload, size_t payl
     uint16_t handle = s_fido_status_val_handle ? s_fido_status_val_handle : s_status_val_handle;
     if (handle == 0) {
         ESP_LOGE(TAG, "FIDO status handle is not registered!");
-        return false;
+        goto out;
     }
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(buf, first_packet_len);
@@ -253,6 +264,9 @@ static bool ble_send_ctap_frame(uint8_t cmd, const uint8_t *payload, size_t payl
     size_t sent = first_len;
     uint8_t seq = 0;
     while (sent < payload_len) {
+        if (!s_is_connected || s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_stopping) {
+            goto out;
+        }
         size_t chunk_data_len = payload_len - sent;
         if (chunk_data_len > (max_chunk - 1)) {
             chunk_data_len = max_chunk - 1;
@@ -272,7 +286,10 @@ static bool ble_send_ctap_frame(uint8_t cmd, const uint8_t *payload, size_t payl
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    return true;
+    ok = true;
+out:
+    if (s_tx_mutex) xSemaphoreGive(s_tx_mutex);
+    return ok;
 }
 
 /* User Presence & Keep-alive State */
@@ -281,6 +298,18 @@ typedef enum {
     CTAP_OP_MAKE_CREDENTIAL,
     CTAP_OP_GET_ASSERTION
 } pending_ctap_op_t;
+
+typedef struct {
+    pending_ctap_op_t op;
+    char rpid[64];
+    uint8_t user_id[64];
+    size_t user_id_len;
+    uint8_t allow_list[CTAP_MAX_MSG_LEN];
+    size_t allow_list_len;
+    uint8_t rpid_hash[32];
+    uint8_t cdh[32];
+    bool uv;
+} pending_ctap_snapshot_t;
 
 static volatile pending_ctap_op_t s_pending_op = CTAP_OP_NONE;
 static char s_pending_rpid[64] = "webauthn.io";
@@ -294,6 +323,7 @@ static uint8_t s_pending_cdh[32];
 static volatile bool s_pending_uv = false;
 static volatile uint32_t s_op_start_tick = 0;
 static volatile uint32_t s_last_keepalive_tick = 0;
+static pending_ctap_snapshot_t s_app_confirm_snap;
 
 void auth_ble_tick(void)
 {
@@ -304,35 +334,47 @@ void auth_ble_tick(void)
     }
     s_tick_active = true;
     portEXIT_CRITICAL(&s_tick_lock);
-    if (s_pending_op != CTAP_OP_NONE && s_is_connected) {
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        if (now - s_last_keepalive_tick >= 500) {
-            s_last_keepalive_tick = now;
-            uint8_t tup[1] = { 0x02 }; /* STATUS_UP_NEEDED (500ms CTAP standard) */
-            ble_send_ctap_frame(0x82, tup, 1);
-        }
 
-        /* 30-second timeout */
-        if (now - s_op_start_tick >= 30000) {
-            ESP_LOGW(TAG, "CTAP operation timed out on device!");
-            uint8_t err_resp[1] = { 0x32 }; /* CTAP2_ERR_USER_ACTION_TIMEOUT */
-            ble_send_ctap_frame(0x83, err_resp, 1);
+    bool send_keepalive = false;
+    bool timed_out = false;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    portENTER_CRITICAL(&s_pending_lock);
+    if (s_pending_op != CTAP_OP_NONE && s_is_connected) {
+        if (now - s_op_start_tick >= FIDO_DEFAULT_TIMEOUT_MS + 2000U) {
             s_pending_op = CTAP_OP_NONE;
-            if (s_req_cb) {
-                fido_parsed_cmd_t cmd_evt = { 0 };
-                cmd_evt.type = FIDO_CMD_CANCEL;
-                s_req_cb(&cmd_evt);
-            }
+            s_pending_uv = false;
+            s_pending_allow_list_len = 0;
+            timed_out = true;
+        } else if (now - s_last_keepalive_tick >= 500U) {
+            s_last_keepalive_tick = now;
+            send_keepalive = true;
         }
     }
+    portEXIT_CRITICAL(&s_pending_lock);
+
+    if (timed_out) {
+        ESP_LOGW(TAG, "CTAP operation timed out on device!");
+        uint8_t err_resp[1] = { 0x32 }; /* CTAP2_ERR_USER_ACTION_TIMEOUT */
+        ble_send_ctap_frame(0x83, err_resp, 1);
+        if (s_req_cb) {
+            fido_parsed_cmd_t cmd_evt = { 0 };
+            cmd_evt.type = FIDO_CMD_CANCEL;
+            s_req_cb(&cmd_evt);
+        }
+    } else if (send_keepalive) {
+        uint8_t tup[1] = { 0x02 }; /* STATUS_UP_NEEDED (500ms CTAP standard) */
+        ble_send_ctap_frame(0x82, tup, 1);
+    }
+
     portENTER_CRITICAL(&s_tick_lock);
     s_tick_active = false;
     portEXIT_CRITICAL(&s_tick_lock);
 }
 
-static void send_fido2_make_credential_response(const char *rpid, const uint8_t rpid_hash[32], const uint8_t cdh[32])
+static void send_fido2_make_credential_response(const pending_ctap_snapshot_t *snap)
 {
-    (void)cdh;
+    const char *rpid = snap->rpid;
+    const uint8_t *rpid_hash = snap->rpid_hash;
     uint8_t priv[32], cred_id[FIDO_CRED_ID_LEN];
     if (!derive_fido_key(rpid, priv, cred_id, sizeof(cred_id), true)) {
         const uint8_t error = 0x7f; /* CTAP2_ERR_OTHER: stable key material unavailable. */
@@ -353,8 +395,8 @@ static void send_fido2_make_credential_response(const char *rpid, const uint8_t 
     mbedtls_ecdsa_free(&ctx);
 
     /* Success requires the user handle to be durable as well as the key. */
-    if (s_pending_user_id_len > 0) {
-        if (!auth_fido_save_user(rpid, s_pending_user_id, s_pending_user_id_len)) {
+    if (snap->user_id_len > 0) {
+        if (!auth_fido_save_user(rpid, snap->user_id, snap->user_id_len)) {
             const uint8_t error = 0x7f;
             ble_send_ctap_frame(0x83, &error, 1);
             return;
@@ -364,7 +406,7 @@ static void send_fido2_make_credential_response(const char *rpid, const uint8_t 
     uint8_t cbor_resp[384];
     size_t cr = ctap2_build_make_credential_resp(rpid_hash, s_aaguid, cred_id,
                                                  sizeof(cred_id), qx, qy, 0,
-                                                 s_pending_uv ? 0x45 : 0x41,
+                                                 snap->uv ? 0x45 : 0x41,
                                                  cbor_resp, sizeof(cbor_resp));
 
     ESP_LOGI(TAG, "Sending FIDO2 MakeCredential response (%u bytes, rp=%s)", (unsigned int)cr, rpid);
@@ -372,10 +414,13 @@ static void send_fido2_make_credential_response(const char *rpid, const uint8_t 
     ble_send_ctap_frame(0x83, cbor_resp, cr);
 }
 
-static void send_fido2_get_assertion_response(const char *rpid, const uint8_t rpid_hash[32], const uint8_t cdh[32])
+static void send_fido2_get_assertion_response(const pending_ctap_snapshot_t *snap)
 {
+    const char *rpid = snap->rpid;
+    const uint8_t *rpid_hash = snap->rpid_hash;
+    const uint8_t *cdh = snap->cdh;
     uint32_t sign_count = 0;
-    const uint8_t auth_flags = s_pending_uv ? 0x05 : 0x01; /* UP | UV when verified */
+    const uint8_t auth_flags = snap->uv ? 0x05 : 0x01; /* UP | UV when verified */
 
     uint8_t priv[32], cred_id[FIDO_CRED_ID_LEN];
     if (!derive_fido_key(rpid, priv, cred_id, sizeof(cred_id), false)) {
@@ -384,8 +429,8 @@ static void send_fido2_get_assertion_response(const char *rpid, const uint8_t rp
         return;
     }
 
-    if (s_pending_allow_list_len &&
-        !ctap2_allow_list_contains(s_pending_allow_list, s_pending_allow_list_len,
+    if (snap->allow_list_len &&
+        !ctap2_allow_list_contains(snap->allow_list, snap->allow_list_len,
                                    cred_id, sizeof(cred_id))) {
         clear_key_bytes(priv, sizeof(priv));
         const uint8_t err = 0x2E; /* CTAP2_ERR_NO_CREDENTIALS */
@@ -447,21 +492,56 @@ static void send_fido2_get_assertion_response(const char *rpid, const uint8_t rp
     ble_send_ctap_frame(0x83, cbor_resp, cr);
 }
 
+static bool take_pending_snapshot(pending_ctap_snapshot_t *out)
+{
+    portENTER_CRITICAL(&s_pending_lock);
+    if (!s_ble_initialized || s_pending_op == CTAP_OP_NONE) {
+        portEXIT_CRITICAL(&s_pending_lock);
+        return false;
+    }
+    out->op = s_pending_op;
+    memcpy(out->rpid, s_pending_rpid, sizeof(out->rpid));
+    memcpy(out->user_id, s_pending_user_id, sizeof(out->user_id));
+    out->user_id_len = s_pending_user_id_len;
+    out->allow_list_len = s_pending_allow_list_len;
+    if (s_pending_allow_list_len) {
+        memcpy(out->allow_list, s_pending_allow_list, s_pending_allow_list_len);
+    }
+    memcpy(out->rpid_hash, s_pending_rpid_hash, sizeof(out->rpid_hash));
+    memcpy(out->cdh, s_pending_cdh, sizeof(out->cdh));
+    out->uv = s_pending_uv;
+
+    s_pending_op = CTAP_OP_NONE;
+    s_pending_uv = false;
+    s_pending_allow_list_len = 0;
+    s_pending_user_id_len = 0;
+    portEXIT_CRITICAL(&s_pending_lock);
+    return true;
+}
+
 void auth_ble_fido_user_confirm(bool approved)
 {
-    if (!s_ble_initialized || s_pending_op == CTAP_OP_NONE) return;
+    if (!take_pending_snapshot(&s_app_confirm_snap)) return;
 
     if (approved) {
-        if (s_pending_op == CTAP_OP_MAKE_CREDENTIAL) {
-            send_fido2_make_credential_response(s_pending_rpid, s_pending_rpid_hash, s_pending_cdh);
-        } else if (s_pending_op == CTAP_OP_GET_ASSERTION) {
-            send_fido2_get_assertion_response(s_pending_rpid, s_pending_rpid_hash, s_pending_cdh);
+        if (s_app_confirm_snap.op == CTAP_OP_MAKE_CREDENTIAL) {
+            send_fido2_make_credential_response(&s_app_confirm_snap);
+        } else if (s_app_confirm_snap.op == CTAP_OP_GET_ASSERTION) {
+            send_fido2_get_assertion_response(&s_app_confirm_snap);
         }
     } else {
         uint8_t err_resp[1] = { 0x27 }; /* CTAP2_ERR_OPERATION_DENIED */
         ble_send_ctap_frame(0x83, err_resp, 1);
     }
-    s_pending_op = CTAP_OP_NONE;
+    clear_key_bytes(&s_app_confirm_snap, sizeof(s_app_confirm_snap));
+}
+
+void auth_ble_fido_user_timeout(void)
+{
+    if (!take_pending_snapshot(&s_app_confirm_snap)) return;
+    uint8_t err_resp[1] = { 0x32 }; /* CTAP2_ERR_USER_ACTION_TIMEOUT */
+    ble_send_ctap_frame(0x83, err_resp, 1);
+    clear_key_bytes(&s_app_confirm_snap, sizeof(s_app_confirm_snap));
 }
 
 /* CTAP RX Buffer for Multi-packet Reassembly */
@@ -481,10 +561,11 @@ static size_t build_getinfo_response(uint8_t *out, size_t max_out)
 {
     if (max_out < 160) return 0;
 
+    const bool pin_set = fido_pin_is_set();
     size_t n = 0;
 
     out[n++] = 0x00; /* CTAP1_ERR_SUCCESS */
-    out[n++] = 0xA6; /* Map(6) */
+    out[n++] = 0xA7; /* Map(7) */
     out[n++] = 0x01; out[n++] = 0x82;
     out[n++] = 0x68; memcpy(out + n, "FIDO_2_1", 8); n += 8;
     out[n++] = 0x68; memcpy(out + n, "FIDO_2_0", 8); n += 8;
@@ -495,9 +576,10 @@ static size_t build_getinfo_response(uint8_t *out, size_t max_out)
     out[n++] = 0x62; memcpy(out + n, "uv", 2); n += 2; out[n++] = 0xF4;
     out[n++] = 0x64; memcpy(out + n, "plat", 4); n += 4; out[n++] = 0xF4;
     out[n++] = 0x68; memcpy(out + n, "alwaysUv", 8); n += 8; out[n++] = 0xF4;
-    out[n++] = 0x69; memcpy(out + n, "clientPin", 9); n += 9; out[n++] = 0xF4;
+    out[n++] = 0x69; memcpy(out + n, "clientPin", 9); n += 9; out[n++] = pin_set ? 0xF5 : 0xF4;
     out[n++] = 0x70; memcpy(out + n, "makeCredUvNotRqd", 16); n += 16; out[n++] = 0xF5;
     out[n++] = 0x05; out[n++] = 0x19; out[n++] = 0x04; out[n++] = 0x00;
+    out[n++] = 0x06; out[n++] = 0x82; out[n++] = 0x02; out[n++] = 0x01; /* pinUvAuthProtocols: [2, 1] */
     out[n++] = 0x09; out[n++] = 0x81; out[n++] = 0x63;
     memcpy(out + n, "ble", 3); n += 3;
     out[n++] = 0x0A; out[n++] = 0x81; out[n++] = 0xA2;
@@ -505,6 +587,16 @@ static size_t build_getinfo_response(uint8_t *out, size_t max_out)
     out[n++] = 0x64; memcpy(out + n, "type", 4); n += 4;
     out[n++] = 0x6A; memcpy(out + n, "public-key", 10); n += 10;
     return n;
+}
+
+static void clear_pending_op(void)
+{
+    portENTER_CRITICAL(&s_pending_lock);
+    s_pending_op = CTAP_OP_NONE;
+    s_pending_uv = false;
+    s_pending_allow_list_len = 0;
+    s_pending_user_id_len = 0;
+    portEXIT_CRITICAL(&s_pending_lock);
 }
 
 static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, size_t len)
@@ -538,17 +630,25 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
         if (ctap_cmd == 0x01) {
             /* authenticatorMakeCredential */
             ESP_LOGI(TAG, "Passkey Registration (MakeCredential) requested!");
-            if (s_pending_op != CTAP_OP_NONE) {
+            portENTER_CRITICAL(&s_pending_lock);
+            bool busy = s_pending_op != CTAP_OP_NONE;
+            portEXIT_CRITICAL(&s_pending_lock);
+            if (busy) {
                 uint8_t busy_resp[1] = { 0x2A }; /* CTAP2_ERR_OPERATION_PENDING */
                 ble_send_ctap_frame(0x83, busy_resp, 1);
                 return;
             }
+            static char rx_rpid[64];
+            static char rx_username[64];
+            static uint8_t rx_cdh[32];
+            static uint8_t rx_user_id[64];
+            size_t rx_user_id_len = 0;
             fido_auth_params_t auth;
             if (!ctap2_parse_make_credential(payload, len,
-                                             s_pending_rpid, sizeof(s_pending_rpid),
-                                             s_pending_cdh,
-                                             s_pending_username, sizeof(s_pending_username),
-                                             s_pending_user_id, &s_pending_user_id_len,
+                                             rx_rpid, sizeof(rx_rpid),
+                                             rx_cdh,
+                                             rx_username, sizeof(rx_username),
+                                             rx_user_id, &rx_user_id_len,
                                              &auth)) {
                 ESP_LOGE(TAG, "MakeCredential CBOR parse failed");
                 uint8_t err_resp[1] = { 0x12 }; /* CTAP2_ERR_INVALID_CBOR */
@@ -556,12 +656,12 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
                 return;
             }
             ESP_LOGI(TAG, "MakeCredential rp='%s' user='%s' cdh0=%02X uvReq=%d pinAuth=%u",
-                     s_pending_rpid, s_pending_username, s_pending_cdh[0],
+                     rx_rpid, rx_username, rx_cdh[0],
                      (int)auth.uv_requested, (unsigned)auth.pin_uv_auth_param_len);
 
             bool uv = false;
             if (auth.pin_uv_auth_param_len > 0) {
-                if (!fido_pin_verify_pin_auth(s_pending_cdh, auth.pin_uv_auth_param,
+                if (!fido_pin_verify_pin_auth(rx_cdh, auth.pin_uv_auth_param,
                                               auth.pin_uv_auth_param_len)) {
                     ESP_LOGW(TAG, "MakeCredential pinUvAuthParam invalid");
                     uint8_t err_resp[1] = { 0x33 }; /* PIN_AUTH_INVALID */
@@ -576,12 +676,29 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
                    client will reject the response after inspecting the flags. */
                 uv = false;
             }
-            s_pending_uv = uv;
 
-            mbedtls_sha256((const unsigned char *)s_pending_rpid, strlen(s_pending_rpid), s_pending_rpid_hash, 0);
+            uint8_t rx_rpid_hash[32];
+            mbedtls_sha256((const unsigned char *)rx_rpid, strlen(rx_rpid), rx_rpid_hash, 0);
+            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+            portENTER_CRITICAL(&s_pending_lock);
+            if (s_pending_op != CTAP_OP_NONE) {
+                portEXIT_CRITICAL(&s_pending_lock);
+                uint8_t busy_resp[1] = { 0x2A };
+                ble_send_ctap_frame(0x83, busy_resp, 1);
+                return;
+            }
+            memcpy(s_pending_rpid, rx_rpid, sizeof(s_pending_rpid));
+            memcpy(s_pending_username, rx_username, sizeof(s_pending_username));
+            memcpy(s_pending_user_id, rx_user_id, sizeof(s_pending_user_id));
+            s_pending_user_id_len = rx_user_id_len;
+            s_pending_allow_list_len = 0;
+            memcpy(s_pending_cdh, rx_cdh, sizeof(s_pending_cdh));
+            memcpy(s_pending_rpid_hash, rx_rpid_hash, sizeof(s_pending_rpid_hash));
+            s_pending_uv = uv;
             s_pending_op = CTAP_OP_MAKE_CREDENTIAL;
-            s_op_start_tick = (uint32_t)(esp_timer_get_time() / 1000ULL);
-            s_last_keepalive_tick = s_op_start_tick;
+            s_op_start_tick = now;
+            s_last_keepalive_tick = now;
+            portEXIT_CRITICAL(&s_pending_lock);
 
             /* Immediate keepalive to client */
             uint8_t tup[1] = { 0x02 }; /* STATUS_UP_NEEDED */
@@ -590,8 +707,8 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
             if (s_req_cb) {
                 fido_parsed_cmd_t cmd_evt = { 0 };
                 cmd_evt.type = FIDO_CMD_REG_REQ;
-                strncpy(cmd_evt.param1, s_pending_rpid, sizeof(cmd_evt.param1));
-                strncpy(cmd_evt.param2, s_pending_username[0] ? s_pending_username : "Passkey User", sizeof(cmd_evt.param2));
+                strncpy(cmd_evt.param1, rx_rpid, sizeof(cmd_evt.param1) - 1);
+                strncpy(cmd_evt.param2, rx_username[0] ? rx_username : "Passkey User", sizeof(cmd_evt.param2) - 1);
                 s_req_cb(&cmd_evt);
             }
             return;
@@ -600,17 +717,22 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
         if (ctap_cmd == 0x02) {
             /* authenticatorGetAssertion */
             ESP_LOGI(TAG, "Passkey Authentication (GetAssertion) requested!");
-            if (s_pending_op != CTAP_OP_NONE) {
+            portENTER_CRITICAL(&s_pending_lock);
+            bool busy = s_pending_op != CTAP_OP_NONE;
+            portEXIT_CRITICAL(&s_pending_lock);
+            if (busy) {
                 uint8_t busy_resp[1] = { 0x2A }; /* CTAP2_ERR_OPERATION_PENDING */
                 ble_send_ctap_frame(0x83, busy_resp, 1);
                 return;
             }
+            static char rx_rpid[64];
+            static uint8_t rx_cdh[32];
             uint8_t allow_id[64] = {0};
             size_t allow_id_len = 0;
             fido_auth_params_t auth;
             if (!ctap2_parse_get_assertion(payload, len,
-                                           s_pending_rpid, sizeof(s_pending_rpid),
-                                           s_pending_cdh,
+                                           rx_rpid, sizeof(rx_rpid),
+                                           rx_cdh,
                                            allow_id, &allow_id_len,
                                            &auth)) {
                 ESP_LOGE(TAG, "GetAssertion CBOR parse failed");
@@ -619,19 +741,17 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
                 return;
             }
             ESP_LOGI(TAG, "GetAssertion rp='%s' allowIdLen=%u cdh0=%02X uvReq=%d pinAuth=%u",
-                     s_pending_rpid, (unsigned)allow_id_len, s_pending_cdh[0],
+                     rx_rpid, (unsigned)allow_id_len, rx_cdh[0],
                      (int)auth.uv_requested, (unsigned)auth.pin_uv_auth_param_len);
             if (auth.allow_list_len > sizeof(s_pending_allow_list)) {
                 const uint8_t error = 0x15; /* CTAP2_ERR_LIMIT_EXCEEDED */
                 ble_send_ctap_frame(0x83, &error, 1);
                 return;
             }
-            if (auth.allow_list_len) memcpy(s_pending_allow_list, auth.allow_list, auth.allow_list_len);
-            s_pending_allow_list_len = auth.allow_list_len;
 
             bool uv = false;
             if (auth.pin_uv_auth_param_len > 0) {
-                if (!fido_pin_verify_pin_auth(s_pending_cdh, auth.pin_uv_auth_param,
+                if (!fido_pin_verify_pin_auth(rx_cdh, auth.pin_uv_auth_param,
                                               auth.pin_uv_auth_param_len)) {
                     ESP_LOGW(TAG, "GetAssertion pinUvAuthParam invalid");
                     uint8_t err_resp[1] = { 0x33 }; /* PIN_AUTH_INVALID */
@@ -646,12 +766,28 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
                    client will reject the response after inspecting the flags. */
                 uv = false;
             }
-            s_pending_uv = uv;
 
-            mbedtls_sha256((const unsigned char *)s_pending_rpid, strlen(s_pending_rpid), s_pending_rpid_hash, 0);
+            uint8_t rx_rpid_hash[32];
+            mbedtls_sha256((const unsigned char *)rx_rpid, strlen(rx_rpid), rx_rpid_hash, 0);
+            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+            portENTER_CRITICAL(&s_pending_lock);
+            if (s_pending_op != CTAP_OP_NONE) {
+                portEXIT_CRITICAL(&s_pending_lock);
+                uint8_t busy_resp[1] = { 0x2A };
+                ble_send_ctap_frame(0x83, busy_resp, 1);
+                return;
+            }
+            memcpy(s_pending_rpid, rx_rpid, sizeof(s_pending_rpid));
+            memcpy(s_pending_cdh, rx_cdh, sizeof(s_pending_cdh));
+            memcpy(s_pending_rpid_hash, rx_rpid_hash, sizeof(s_pending_rpid_hash));
+            if (auth.allow_list_len) memcpy(s_pending_allow_list, auth.allow_list, auth.allow_list_len);
+            s_pending_allow_list_len = auth.allow_list_len;
+            s_pending_user_id_len = 0;
+            s_pending_uv = uv;
             s_pending_op = CTAP_OP_GET_ASSERTION;
-            s_op_start_tick = (uint32_t)(esp_timer_get_time() / 1000ULL);
-            s_last_keepalive_tick = s_op_start_tick;
+            s_op_start_tick = now;
+            s_last_keepalive_tick = now;
+            portEXIT_CRITICAL(&s_pending_lock);
 
             /* Immediate keepalive to client */
             uint8_t tup[1] = { 0x02 }; /* STATUS_UP_NEEDED */
@@ -660,8 +796,8 @@ static void process_complete_ctap_message(uint8_t cmd, const uint8_t *payload, s
             if (s_req_cb) {
                 fido_parsed_cmd_t cmd_evt = { 0 };
                 cmd_evt.type = FIDO_CMD_AUTH_REQ;
-                strncpy(cmd_evt.param1, s_pending_rpid, sizeof(cmd_evt.param1));
-                strncpy(cmd_evt.param2, "Passkey User", sizeof(cmd_evt.param2));
+                strncpy(cmd_evt.param1, rx_rpid, sizeof(cmd_evt.param1) - 1);
+                strncpy(cmd_evt.param2, "Passkey User", sizeof(cmd_evt.param2) - 1);
                 s_req_cb(&cmd_evt);
             }
             return;
@@ -823,7 +959,7 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
     else if (ble_uuid_cmp(ctxt->chr->uuid, &s_char_fido_cp_uuid.u) == 0 ||
              ble_uuid_cmp(ctxt->chr->uuid, &s_companion_cp_uuid.u) == 0) {
         if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-            uint8_t rx_buf[1024];
+            static uint8_t rx_buf[CTAP_MAX_MSG_LEN];
             uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
             if (len > sizeof(rx_buf)) len = sizeof(rx_buf);
             int rc = ble_hs_mbuf_to_flat(ctxt->om, rx_buf, len, NULL);
@@ -832,7 +968,7 @@ static int gatt_svr_chr_access(uint16_t conn_handle, uint16_t attr_handle,
             /* Handle CMD_CANCEL (0xBE) */
             if (rx_buf[0] == 0xBE) {
                 ESP_LOGI(TAG, "Client sent CMD_CANCEL (0xBE)");
-                s_pending_op = CTAP_OP_NONE;
+                clear_pending_op();
                 s_rx_ctx.in_progress = false;
                 static const uint8_t s_cancel_resp[] = { 0x2D }; /* CTAP2_ERR_KEEPALIVE_CANCEL */
                 ble_send_ctap_frame(0x83, s_cancel_resp, sizeof(s_cancel_resp));
@@ -929,9 +1065,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
             s_conn_handle = event->connect.conn_handle;
             s_is_connected = true;
             s_rx_ctx.in_progress = false;
-            s_pending_op = CTAP_OP_NONE;
-            s_pending_uv = false;
-            s_pending_allow_list_len = 0;
+            clear_pending_op();
             fido_pin_reset_token();
             ESP_LOGI(TAG, "BLE connected handle=%d", s_conn_handle);
         } else {
@@ -945,9 +1079,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         s_is_connected = false;
         s_rx_ctx.in_progress = false;
-        s_pending_op = CTAP_OP_NONE;
-        s_pending_uv = false;
-        s_pending_allow_list_len = 0;
+        clear_pending_op();
         fido_pin_reset_token();
         auth_ble_start_advertising();
         break;
@@ -1099,13 +1231,13 @@ bool auth_ble_init(auth_ble_req_cb_t on_req)
     }
 
     s_req_cb = on_req;
+    if (!s_tx_mutex) s_tx_mutex = xSemaphoreCreateMutexStatic(&s_tx_mutex_buf);
     s_host_stopped = false;
     s_stopping = false;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
     s_is_connected = false;
     s_rx_ctx.in_progress = false;
-    s_pending_op = CTAP_OP_NONE;
-    s_pending_uv = false;
+    clear_pending_op();
     fido_pin_init();
 
     int rc = nimble_port_init();
@@ -1204,9 +1336,7 @@ bool auth_ble_stop(void)
     }
     ESP_LOGI(TAG, "Stopping BLE...");
     s_is_connected = false;
-    s_pending_op = CTAP_OP_NONE;
-    s_pending_uv = false;
-    s_pending_allow_list_len = 0;
+    clear_pending_op();
     s_rx_ctx.in_progress = false;
     fido_pin_reset_token();
     if (!s_host_stopped) {
@@ -1243,6 +1373,7 @@ bool auth_ble_init(auth_ble_req_cb_t on_req) { (void)on_req; return true; }
 void auth_ble_start_advertising(void) {}
 bool auth_ble_send_response(const char *response_str) { (void)response_str; return true; }
 void auth_ble_fido_user_confirm(bool approved) { (void)approved; }
+void auth_ble_fido_user_timeout(void) {}
 void auth_ble_tick(void) {}
 bool auth_ble_is_enabled(void) { return false; }
 bool auth_ble_is_connected(void) { return false; }

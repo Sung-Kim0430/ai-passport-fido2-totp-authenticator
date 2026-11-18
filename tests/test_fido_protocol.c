@@ -313,6 +313,12 @@ static void test_ctap2_cbor_parsers_and_builders(void)
     assert(resp_buf[92] == 0x05); /* Flags: UP + UV */
     assert(resp_buf[93] == 0x00 && resp_buf[94] == 0x00 &&
            resp_buf[95] == 0x00 && resp_buf[96] == 0x01); /* signCount = 1 */
+    /* Canonical CBOR: 70-byte sig uses 0x58 0x46, 2-byte user.id uses 0x42 (not 0x58 0x02) */
+    assert(resp_buf[97] == 0x03 && resp_buf[98] == 0x58 && resp_buf[99] == 70);
+    assert(resp_buf[170] == 0x04 && resp_buf[171] == 0xA1 &&
+           resp_buf[172] == 0x62 && resp_buf[173] == 'i' && resp_buf[174] == 'd' &&
+           resp_buf[175] == 0x42 && resp_buf[176] == 0xA1 && resp_buf[177] == 0xB2);
+    assert(resp_len == 178);
 
     printf("CTAP2 CBOR parsers and response builders: PASS\n");
 }

@@ -22,8 +22,9 @@ void auth_ble_start_advertising(void);
 // 向已连接并订阅的 companion 客户端发送文本响应。
 bool auth_ble_send_response(const char *response_str);
 
-// 应用任务提交用户在设备上的确认/拒绝，不把按键存在当作用户验证。
+// 应用任务提交用户在设备上的确认/拒绝或超时，不把按键存在当作用户验证。
 void auth_ble_fido_user_confirm(bool approved);
+void auth_ble_fido_user_timeout(void);
 
 // 处理 keep-alive 与请求超时；停止协议栈前必须等本次发送退出。
 void auth_ble_tick(void);

@@ -184,6 +184,7 @@ run_static_checks() (
         "${test_dir}/test_demo_${demo}_runtime"
     done
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_ble_material.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_fido_pin_cbor.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_auth_lifecycle.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_profile.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_poll.py
@@ -202,6 +203,13 @@ run_static_checks() (
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_archive_firmware.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_install_passport_skills.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_validate_temp_paths.py
+    if command -v cmake >/dev/null 2>&1 && [[ -f managed_components/lvgl__lvgl/CMakeLists.txt ]]; then
+        cmake -S tests/auth_ui_host -B "${test_dir}/auth_ui_host" >/dev/null
+        cmake --build "${test_dir}/auth_ui_host" >/dev/null
+        ctest --test-dir "${test_dir}/auth_ui_host" --output-on-failure
+    else
+        echo "Host LVGL render test: SKIPPED (cmake or managed_components/lvgl__lvgl unavailable)"
+    fi
     echo "Host tests: PASS"
     if [[ "${actionlint_skipped}" == 1 ]]; then
         echo "Static checks: PASS with actionlint SKIPPED (report it as not run)"

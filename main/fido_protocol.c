@@ -696,8 +696,9 @@ size_t ctap2_build_get_assertion_resp(const uint8_t rpid_hash[32],
         return 0;
     }
 
-    const size_t required = 66 + (cred_id_len < 24 ? 1 : 2) + cred_id_len + sig_len +
-                            (user_id_len ? 7 + user_id_len : 0);
+    const size_t required = 64 + (cred_id_len < 24 ? 1 : 2) + cred_id_len +
+                            (sig_len < 24 ? 1 : 2) + sig_len +
+                            (user_id_len ? (user_id_len < 24 ? 6 : 7) + user_id_len : 0);
     if (required > max_buf) return 0;
 
     /* 1. Assemble authData (37 bytes): rpIdHash (32) + flags (1) + signCount (4).
@@ -748,8 +749,12 @@ size_t ctap2_build_get_assertion_resp(const uint8_t rpid_hash[32],
 
     /* Key 3: signature (sig_der) */
     out_buf[cr++] = 0x03;
-    out_buf[cr++] = 0x58;
-    out_buf[cr++] = (uint8_t)sig_len;
+    if (sig_len < 24) {
+        out_buf[cr++] = (uint8_t)(0x40 | sig_len);
+    } else {
+        out_buf[cr++] = 0x58;
+        out_buf[cr++] = (uint8_t)sig_len;
+    }
     memcpy(out_buf + cr, sig_der, sig_len); cr += sig_len;
 
     /* Key 4 (optional): user Map(1) (CTAP2 Section 6.2 Key 4) */
@@ -757,7 +762,12 @@ size_t ctap2_build_get_assertion_resp(const uint8_t rpid_hash[32],
         out_buf[cr++] = 0x04;
         out_buf[cr++] = 0xA1;
         out_buf[cr++] = 0x62; out_buf[cr++] = 'i'; out_buf[cr++] = 'd';
-        out_buf[cr++] = 0x58; out_buf[cr++] = (uint8_t)user_id_len;
+        if (user_id_len < 24) {
+            out_buf[cr++] = (uint8_t)(0x40 | user_id_len);
+        } else {
+            out_buf[cr++] = 0x58;
+            out_buf[cr++] = (uint8_t)user_id_len;
+        }
         memcpy(out_buf + cr, user_id, user_id_len); cr += user_id_len;
     }
 

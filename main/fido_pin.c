@@ -55,7 +55,14 @@ typedef struct {
 } fido_pin_state_t;
 
 static fido_pin_state_t s_pin;
+static StaticSemaphore_t s_mutex_storage;
 static SemaphoreHandle_t s_mutex = NULL;
+
+static void clear_secret_bytes(void *data, size_t len)
+{
+    volatile uint8_t *p = data;
+    while (len--) *p++ = 0;
+}
 
 static void pin_lock(void)
 {
@@ -102,8 +109,9 @@ static bool cbor_head(const uint8_t *buf, size_t len, size_t *off,
     return true;
 }
 
-static bool cbor_skip(const uint8_t *buf, size_t len, size_t *off)
+static bool cbor_skip_depth(const uint8_t *buf, size_t len, size_t *off, unsigned depth)
 {
+    if (depth >= 16 || *off >= len) return false;
     uint8_t major = 0;
     uint64_t val = 0;
     if (!cbor_head(buf, len, off, &major, &val)) return false;
@@ -114,23 +122,30 @@ static bool cbor_skip(const uint8_t *buf, size_t len, size_t *off)
         return true;
     case 2:
     case 3:
-        if (*off + val > len) return false;
+        if (val > len - *off) return false;
         *off += (size_t)val;
         return true;
     case 4:
+        if (val > len - *off) return false;
         for (uint64_t i = 0; i < val; i++) {
-            if (!cbor_skip(buf, len, off)) return false;
+            if (!cbor_skip_depth(buf, len, off, depth + 1)) return false;
         }
         return true;
     case 5:
+        if (val > (len - *off) / 2) return false;
         for (uint64_t i = 0; i < val; i++) {
-            if (!cbor_skip(buf, len, off)) return false;
-            if (!cbor_skip(buf, len, off)) return false;
+            if (!cbor_skip_depth(buf, len, off, depth + 1)) return false;
+            if (!cbor_skip_depth(buf, len, off, depth + 1)) return false;
         }
         return true;
     default:
         return false;
     }
+}
+
+static bool cbor_skip(const uint8_t *buf, size_t len, size_t *off)
+{
+    return cbor_skip_depth(buf, len, off, 0);
 }
 
 static bool cbor_uint(const uint8_t *buf, size_t len, size_t *off, uint64_t *out)
@@ -275,9 +290,11 @@ static bool compute_shared_secret(uint8_t protocol, const uint8_t x[32], const u
     if (mbedtls_ecp_point_write_binary(&s_pin.grp, &shared, MBEDTLS_ECP_PF_UNCOMPRESSED,
                                        &shared_len, shared_buf, sizeof(shared_buf)) != 0 ||
         shared_len != sizeof(shared_buf)) {
+        clear_secret_bytes(shared_buf, sizeof(shared_buf));
         goto out;
     }
     memcpy(secret, shared_buf + 1, sizeof(secret));
+    clear_secret_bytes(shared_buf, sizeof(shared_buf));
 
     if (protocol == 1) {
         mbedtls_sha256(secret, sizeof(secret), s_pin.shared_secret, 0);
@@ -289,6 +306,7 @@ static bool compute_shared_secret(uint8_t protocol, const uint8_t x[32], const u
     }
 
 out:
+    clear_secret_bytes(secret, sizeof(secret));
     mbedtls_ecp_point_free(&client);
     mbedtls_ecp_point_free(&shared);
     return ok;
@@ -300,52 +318,67 @@ static bool verify_pin_uv_auth(uint8_t protocol, const uint8_t *message, size_t 
     const uint8_t *key = (protocol == 2) ? s_pin.hmac_key : s_pin.shared_secret;
     uint8_t mac[32];
     hmac_sha256(key, 32, message, message_len, mac);
+    bool ok;
     if (protocol == 2) {
-        return param_len >= 32 && memcmp(mac, param, 32) == 0;
+        ok = param_len >= 32 && memcmp(mac, param, 32) == 0;
+    } else {
+        ok = param_len >= 16 && memcmp(mac, param, 16) == 0;
     }
-    return param_len >= 16 && memcmp(mac, param, 16) == 0;
+    clear_secret_bytes(mac, sizeof(mac));
+    return ok;
 }
 
 static bool decrypt_new_pin(const uint8_t *enc, size_t enc_len, uint8_t pin_hash[16])
 {
     uint8_t plain[288];
     size_t plain_len = 0;
+    bool ok = false;
     if (s_pin.protocol == 1) {
-        if (enc_len < 16 || (enc_len % 16) != 0 || enc_len > sizeof(plain)) return false;
-        if (!aes_cbc_crypt(s_pin.shared_secret, MBEDTLS_AES_DECRYPT, enc, enc_len, plain)) return false;
+        if (enc_len < 16 || (enc_len % 16) != 0 || enc_len > sizeof(plain)) goto cleanup;
+        if (!aes_cbc_crypt(s_pin.shared_secret, MBEDTLS_AES_DECRYPT, enc, enc_len, plain)) goto cleanup;
         plain_len = enc_len;
     } else {
-        if (enc_len > sizeof(plain) + 16) return false;
-        if (!aes_cbc_decrypt_prefixed_iv(s_pin.aes_key, enc, enc_len, plain, &plain_len)) return false;
+        if (enc_len > sizeof(plain) + 16) goto cleanup;
+        if (!aes_cbc_decrypt_prefixed_iv(s_pin.aes_key, enc, enc_len, plain, &plain_len)) goto cleanup;
     }
 
     /* newPinEnc contains the UTF-8 PIN padded with zeroes, not the PIN hash. */
-    if (plain_len < 4) return false;
+    if (plain_len < 4) goto cleanup;
     size_t pin_len = 0;
     while (pin_len < plain_len && plain[pin_len] != 0) pin_len++;
-    if (pin_len < 4 || pin_len > 63) return false;
+    if (pin_len < 4 || pin_len > 63) goto cleanup;
 
     uint8_t digest[32];
     mbedtls_sha256(plain, pin_len, digest, 0);
     memcpy(pin_hash, digest, 16);
-    return true;
+    clear_secret_bytes(digest, sizeof(digest));
+    ok = true;
+
+cleanup:
+    clear_secret_bytes(plain, sizeof(plain));
+    return ok;
 }
 
 static bool decrypt_pin_hash(const uint8_t *enc, size_t enc_len, uint8_t pin_hash[16])
 {
     uint8_t plain[32];
     size_t plain_len = 0;
+    bool ok = false;
     if (s_pin.protocol == 1) {
-        if (enc_len != 16) return false;
-        if (!aes_cbc_crypt(s_pin.shared_secret, MBEDTLS_AES_DECRYPT, enc, enc_len, plain)) return false;
+        if (enc_len != 16) goto cleanup;
+        if (!aes_cbc_crypt(s_pin.shared_secret, MBEDTLS_AES_DECRYPT, enc, enc_len, plain)) goto cleanup;
         plain_len = enc_len;
     } else {
-        if (enc_len != 32) return false;
-        if (!aes_cbc_decrypt_prefixed_iv(s_pin.aes_key, enc, enc_len, plain, &plain_len)) return false;
+        if (enc_len != 32) goto cleanup;
+        if (!aes_cbc_decrypt_prefixed_iv(s_pin.aes_key, enc, enc_len, plain, &plain_len)) goto cleanup;
     }
-    if (plain_len < 16) return false;
+    if (plain_len < 16) goto cleanup;
     memcpy(pin_hash, plain, 16);
-    return true;
+    ok = true;
+
+cleanup:
+    clear_secret_bytes(plain, sizeof(plain));
+    return ok;
 }
 
 static bool encrypt_pin_token(const uint8_t pin_token[32], uint8_t *out, size_t *out_len)
@@ -399,7 +432,7 @@ void fido_pin_init(void)
     if (s_pin.initialized) return;
 
     memset(&s_pin, 0, sizeof(s_pin));
-    s_mutex = xSemaphoreCreateMutex();
+    if (!s_mutex) s_mutex = xSemaphoreCreateMutexStatic(&s_mutex_storage);
     mbedtls_ecp_group_init(&s_pin.grp);
     mbedtls_mpi_init(&s_pin.d);
     mbedtls_ecp_point_init(&s_pin.Q);
@@ -434,7 +467,10 @@ void fido_pin_reset_token(void)
 {
     if (!s_pin.initialized) return;
     pin_lock();
-    memset(s_pin.pin_token, 0, sizeof(s_pin.pin_token));
+    clear_secret_bytes(s_pin.pin_token, sizeof(s_pin.pin_token));
+    clear_secret_bytes(s_pin.shared_secret, sizeof(s_pin.shared_secret));
+    clear_secret_bytes(s_pin.aes_key, sizeof(s_pin.aes_key));
+    clear_secret_bytes(s_pin.hmac_key, sizeof(s_pin.hmac_key));
     s_pin.token_valid = false;
     s_pin.key_agreement_valid = false;
     pin_unlock();
@@ -444,10 +480,13 @@ void fido_pin_factory_reset(void)
 {
     fido_pin_init();
     pin_lock();
-    memset(s_pin.pin_hash, 0, sizeof(s_pin.pin_hash));
+    clear_secret_bytes(s_pin.pin_hash, sizeof(s_pin.pin_hash));
     s_pin.pin_set = false;
     s_pin.retries = PIN_DEFAULT_RETRIES;
-    memset(s_pin.pin_token, 0, sizeof(s_pin.pin_token));
+    clear_secret_bytes(s_pin.pin_token, sizeof(s_pin.pin_token));
+    clear_secret_bytes(s_pin.shared_secret, sizeof(s_pin.shared_secret));
+    clear_secret_bytes(s_pin.aes_key, sizeof(s_pin.aes_key));
+    clear_secret_bytes(s_pin.hmac_key, sizeof(s_pin.hmac_key));
     s_pin.token_valid = false;
     s_pin.key_agreement_valid = false;
 
@@ -490,7 +529,7 @@ static bool parse_client_pin(const uint8_t *payload, size_t len, client_pin_req_
     uint64_t pairs = 0;
     if (!cbor_head(payload, len, &off, &major, &pairs) || major != 5) return false;
 
-    for (uint64_t i = 0; i < pairs && off < len; i++) {
+    for (uint64_t i = 0; i < pairs; i++) {
         uint8_t km = 0;
         uint64_t key = 0;
         if (!cbor_head(payload, len, &off, &km, &key)) return false;
@@ -501,13 +540,13 @@ static bool parse_client_pin(const uint8_t *payload, size_t len, client_pin_req_
         switch (key) {
         case 1: {
             uint64_t v = 0;
-            if (!cbor_uint(payload, len, &off, &v)) return false;
+            if (!cbor_uint(payload, len, &off, &v) || v > UINT8_MAX) return false;
             req->protocol = (uint8_t)v;
             break;
         }
         case 2: {
             uint64_t v = 0;
-            if (!cbor_uint(payload, len, &off, &v)) return false;
+            if (!cbor_uint(payload, len, &off, &v) || v > UINT8_MAX) return false;
             req->sub_cmd = (uint8_t)v;
             break;
         }
@@ -532,7 +571,7 @@ static bool parse_client_pin(const uint8_t *payload, size_t len, client_pin_req_
             break;
         }
     }
-    return req->protocol == 1 || req->protocol == 2;
+    return off == len && (req->protocol == 1 || req->protocol == 2);
 }
 
 static size_t pin_error(uint8_t *out, uint8_t err)
@@ -615,10 +654,12 @@ static size_t handle_set_pin(const client_pin_req_t *req, uint8_t *out, size_t m
 
     uint8_t new_hash[16];
     if (!decrypt_new_pin(req->new_pin_enc, req->new_pin_enc_len, new_hash)) {
+        clear_secret_bytes(new_hash, sizeof(new_hash));
         return pin_error(out, 0x02);
     }
 
     memcpy(s_pin.pin_hash, new_hash, sizeof(s_pin.pin_hash));
+    clear_secret_bytes(new_hash, sizeof(new_hash));
     s_pin.pin_set = true;
     s_pin.retries = PIN_DEFAULT_RETRIES;
     s_pin.token_valid = false;
@@ -646,30 +687,37 @@ static size_t handle_change_pin(const client_pin_req_t *req, uint8_t *out, size_
         return pin_error(out, 0x02);
     }
 
-    uint8_t current_hash[16];
-    if (!decrypt_pin_hash(req->pin_hash_enc, req->pin_hash_enc_len, current_hash) ||
-        memcmp(current_hash, s_pin.pin_hash, sizeof(current_hash)) != 0) {
-        if (s_pin.retries > 0) s_pin.retries--;
-        pin_save();
-        return pin_error(out, s_pin.retries == 0 ? CTAP2_ERR_PIN_BLOCKED : CTAP2_ERR_PIN_INVALID);
-    }
     uint8_t mac_msg[352];
     if (req->new_pin_enc_len + req->pin_hash_enc_len > sizeof(mac_msg)) {
         return pin_error(out, 0x02);
     }
     memcpy(mac_msg, req->new_pin_enc, req->new_pin_enc_len);
     memcpy(mac_msg + req->new_pin_enc_len, req->pin_hash_enc, req->pin_hash_enc_len);
-    if (!verify_pin_uv_auth(req->protocol, mac_msg,
-                            req->new_pin_enc_len + req->pin_hash_enc_len,
-                            req->pin_uv_auth_param, req->pin_uv_auth_len)) {
+    bool auth_ok = verify_pin_uv_auth(req->protocol, mac_msg,
+                                      req->new_pin_enc_len + req->pin_hash_enc_len,
+                                      req->pin_uv_auth_param, req->pin_uv_auth_len);
+    clear_secret_bytes(mac_msg, sizeof(mac_msg));
+    if (!auth_ok) {
         return pin_error(out, CTAP2_ERR_PIN_AUTH_INVALID);
+    }
+
+    uint8_t current_hash[16];
+    bool match = decrypt_pin_hash(req->pin_hash_enc, req->pin_hash_enc_len, current_hash) &&
+                 memcmp(current_hash, s_pin.pin_hash, sizeof(current_hash)) == 0;
+    clear_secret_bytes(current_hash, sizeof(current_hash));
+    if (!match) {
+        if (s_pin.retries > 0) s_pin.retries--;
+        pin_save();
+        return pin_error(out, s_pin.retries == 0 ? CTAP2_ERR_PIN_BLOCKED : CTAP2_ERR_PIN_INVALID);
     }
 
     uint8_t new_hash[16];
     if (!decrypt_new_pin(req->new_pin_enc, req->new_pin_enc_len, new_hash)) {
+        clear_secret_bytes(new_hash, sizeof(new_hash));
         return pin_error(out, 0x02);
     }
     memcpy(s_pin.pin_hash, new_hash, sizeof(s_pin.pin_hash));
+    clear_secret_bytes(new_hash, sizeof(new_hash));
     s_pin.retries = PIN_DEFAULT_RETRIES;
     s_pin.token_valid = false;
     memset(s_pin.pin_token, 0, sizeof(s_pin.pin_token));
@@ -695,8 +743,10 @@ static size_t handle_get_pin_token(const client_pin_req_t *req, uint8_t *out, si
     }
 
     uint8_t current_hash[16];
-    if (!decrypt_pin_hash(req->pin_hash_enc, req->pin_hash_enc_len, current_hash) ||
-        memcmp(current_hash, s_pin.pin_hash, sizeof(current_hash)) != 0) {
+    bool match = decrypt_pin_hash(req->pin_hash_enc, req->pin_hash_enc_len, current_hash) &&
+                 memcmp(current_hash, s_pin.pin_hash, sizeof(current_hash)) == 0;
+    clear_secret_bytes(current_hash, sizeof(current_hash));
+    if (!match) {
         if (s_pin.retries > 0) s_pin.retries--;
         pin_save();
         ESP_LOGW(TAG, "Client PIN invalid, retries=%u", s_pin.retries);
@@ -782,6 +832,7 @@ bool fido_pin_verify_pin_auth(const uint8_t client_data_hash[32],
         } else {
             ok = pin_uv_auth_param_len >= 16 && memcmp(mac, pin_uv_auth_param, 16) == 0;
         }
+        clear_secret_bytes(mac, sizeof(mac));
     }
     pin_unlock();
     return ok;

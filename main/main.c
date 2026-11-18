@@ -616,13 +616,14 @@ static void refresh_display(void)
         bool timed_out = fido_session_tick(&s_fido, now_ms, &rem_fido);
         if (timed_out) {
             ui_unlock();
-            auth_ble_fido_user_confirm(false);
+            auth_ble_fido_user_timeout();
             auth_ble_send_response("UP_TIMEOUT");
             ui_lock();
             auth_ui_update_fido_result(false);
             ui_unlock();
             sound_fail();
             vTaskDelay(pdMS_TO_TICKS(800));
+            s_ignore_key_before_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
             auth_enter_view(s_view_before_modal);
             return;
         } else {
