@@ -42,8 +42,10 @@
 #include "freertos/task.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/gpio.h"
+#include "hal/gpio_ll.h"
 #include "esp_intr_alloc.h"
 #include "soc/gpio_reg.h"
+#include "soc/gpio_struct.h"
 #include "soc/soc.h"
 #include <string.h>
 #include <math.h>
@@ -161,6 +163,26 @@ static void IRAM_ATTR clock_key_isr(void *argument)
     (void)argument;
     s_clock_key_seen = true;
 }
+
+#if !CONFIG_AUTH_RTC_WAKE_STUB
+/* Runs immediately from RTC Fast Memory on deep-sleep wake before ROM loads the
+ * bootloader so GPIO21 stays clamped low and held across ROM/bootloader entry. */
+void RTC_IRAM_ATTR esp_wake_deep_sleep(void)
+{
+    esp_default_wake_deep_sleep();
+#if CONFIG_IDF_TARGET_ESP32C3
+    gpio_ll_pullup_dis(&GPIO, BSP_LCD_BL);
+    gpio_ll_pulldown_dis(&GPIO, BSP_LCD_BL);
+    gpio_ll_input_disable(&GPIO, BSP_LCD_BL);
+    gpio_ll_od_disable(&GPIO, BSP_LCD_BL);
+    gpio_ll_matrix_out_default(&GPIO, BSP_LCD_BL);
+    gpio_ll_set_level(&GPIO, BSP_LCD_BL, 0);
+    gpio_ll_func_sel(&GPIO, BSP_LCD_BL, PIN_FUNC_GPIO);
+    gpio_ll_output_enable(&GPIO, BSP_LCD_BL);
+    SET_PERI_REG_MASK(RTC_CNTL_DIG_PAD_HOLD_REG, (UINT32_C(1) << BSP_LCD_BL));
+#endif
+}
+#endif
 
 static bool clock_key_pending(void)
 {
@@ -1420,6 +1442,7 @@ void app_main(void)
     const bool timer_only = clock_deep_wakeup && wake_causes == (1U << ESP_SLEEP_WAKEUP_TIMER);
     const bool observer_ready = timer_only && clock_key_observer_begin();
     bsp_display_backlight_early_off();
+    esp_deep_sleep_disable_rom_logging();
 
     /* 0. NVS Flash initialization */
     esp_err_t nvs_err = nvs_flash_init();
