@@ -1165,6 +1165,10 @@ static void check_history_unavailable_coefficient_recovery(void) {
         } else assert(result == RTC_CLOCK_REFERENCE_SET);
         assert(rtc_clock_diagnostics().learning_reason == RTC_DRIFT_LEARN_PUBLISHED);
         assert(rtc_clock_diagnostics().ppm == 2000);
+        const rtc_clock_calibration_t calibration = rtc_clock_history_owner_summary().calibration;
+        assert(calibration.quality == RTC_CLOCK_CALIBRATION_LEGACY && !calibration.uncertainty_valid);
+        assert(calibration.evidence_sequence == rtc_clock_retained.history.accepted_sequence);
+        assert(calibration.evidence_utc_us == history_test_utc);
         assert(stored_ppm == -870 && coefficient_saves == 0);
         assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
         assert(rtc_clock_retained.session.ppm == 2000);
@@ -1456,6 +1460,11 @@ static void check_variable_history_recovery_activation(void) {
         assert(view.shadow.uncertainty_ppm > 800 && view.durable_count == 3);
         assert(view.active_ppm == (qualified ? -7165 : 0));
         assert(view.active_qualified == (qualified != 0));
+        assert(view.calibration.quality == (qualified ? RTC_CLOCK_CALIBRATION_RECOVERY : RTC_CLOCK_CALIBRATION_NONE));
+        assert(view.calibration.uncertainty_valid == qualified);
+        assert(view.calibration.evidence_sequence == (qualified ? 3 : 0));
+        assert(view.coefficient_saved == false);
+        assert(view.saved_ppm_valid == (qualified != 0));
         assert(wall_us == wall_before && rtc_us == security_before);
         assert(history_writes == writes && coefficient_saves == 0);
         for (unsigned i = 0; i < 10; ++i) { advance_fake(60000000); rtc_clock_tick(); }
@@ -1474,6 +1483,113 @@ static void check_variable_history_recovery_activation(void) {
     const rtc_clock_history_summary_t view = rtc_clock_history_owner_summary();
     assert(view.accepted_sequence == 4 && view.durable_sequence == 3 && !view.pending_count);
     assert(view.active_ppm == -870); /* Missing newer evidence blocks older recovery. */
+}
+
+static void seed_recent_history(bool missing_newest) {
+    rtc_history_t ring;
+    rtc_history_store_t store;
+    const rtc_history_store_io_t io = {NULL, history_read, history_write, history_commit};
+    assert(rtc_history_store_open(&store, &ring, io, source) == RTC_HISTORY_STORE_MISSING);
+    const uint64_t hour = UINT64_C(3600000000);
+    const uint64_t bridge = 25 * hour;
+    const int32_t rates[] = {-7989, -7990, -7988};
+    for (unsigned index = 0; index < 31; ++index) {
+        const int32_t rate = index < 28 ? -870 : rates[index - 28];
+        const rtc_history_record_t row = {
+            .source = source, .sequence = index + 1, .epoch = 1,
+            .utc_end_us = (uint64_t)wall_us - (30 - index) * 26 * hour,
+            .raw = {bridge - bridge * (uint64_t)(-rate) / 1000000, 12345},
+            .awake_delta_us = hour, .utc_delta_us = bridge + hour,
+            .combined_uncertainty_us = 1000000
+        };
+        const rtc_history_store_checkpoint_t checkpoint = {
+            index == 30 && missing_newest ? 32 : index + 1, index == 30 && missing_newest ? 1 : 0
+        };
+        assert(rtc_history_store_append(&store, &row, &checkpoint) == RTC_HISTORY_STORE_VALID);
+    }
+}
+
+static void check_recent_history_activation_and_provenance(void) {
+    for (unsigned kind = 0; kind < 3; ++kind) {
+        reset_all();
+        source = 2;
+        if (kind) { stored_ppm = -7165; coefficient_store = RTC_CLOCK_STORE_VALID; }
+        seed_recent_history(kind == 2);
+        rtc_clock_boot(false, true);
+        rtc_clock_begin_normal_wake();
+        rtc_clock_history_summary_t view = rtc_clock_history_owner_summary();
+        assert(view.shadow.result == RTC_HISTORY_ESTIMATE_RECENT_READY);
+        assert(view.active_ppm == (kind == 1 ? -7990 : kind ? -7165 : 0));
+        if (kind != 1) continue;
+        assert(view.calibration.quality == RTC_CLOCK_CALIBRATION_STABLE);
+        assert(view.calibration.estimator_version == 3 && view.calibration.evidence_sequence == 31);
+        assert(view.calibration.evidence_utc_us == (uint64_t)wall_us);
+        assert(view.calibration.uncertainty_valid && view.calibration.uncertainty_millippm >= 13112);
+        assert(!view.coefficient_saved && view.saved_ppm_valid && view.saved_ppm == -7165);
+        const rtc_clock_calibration_t accepted = view.calibration;
+        reset_learning();
+        assert(!memcmp(&accepted, &rtc_clock_retained.accounting.calibration, sizeof accepted));
+        rtc_clock_retained.accounting.active_ppm = -7165;
+        history_refresh();
+        assert(rtc_clock_retained.accounting.active_ppm == -7165);
+        rtc_clock_retained.accounting.calibration.evidence_sequence = 30;
+        ++rtc_clock_retained.accounting.calibration.evidence_utc_us;
+        history_refresh();
+        assert(rtc_clock_retained.accounting.active_ppm == -7165);
+        rtc_clock_retained.accounting.calibration.evidence_utc_us = accepted.evidence_utc_us;
+        history_refresh();
+        assert(rtc_clock_retained.accounting.active_ppm == -7990);
+        fail_coefficient_save = true;
+        rtc_clock_retained.accounting.coefficient_budget_us = RTC_CLOCK_SAVE_INTERVAL_US;
+        checkpoint_coefficient();
+        view = rtc_clock_history_owner_summary();
+        assert(!view.coefficient_saved && view.saved_ppm == -7165 && coefficient_saves == 1);
+        assert(!memcmp(&accepted, &view.calibration, sizeof accepted));
+        fail_coefficient_save = false;
+        rtc_clock_retained.accounting.coefficient_budget_us = RTC_CLOCK_SAVE_INTERVAL_US;
+        checkpoint_coefficient();
+        assert(rtc_clock_history_owner_summary().coefficient_saved && stored_ppm == -7990);
+        assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+        ticks += armed_interval_us / 3;
+        uptime_us = 1000;
+        reboot_runtime();
+        assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+        view = rtc_clock_history_owner_summary();
+        assert(!memcmp(&accepted, &view.calibration, sizeof accepted));
+        wall_us += INT64_C(91) * 86400 * 1000000;
+        rtc_clock_begin_normal_wake();
+        history_refresh();
+        assert(rtc_clock_history_owner_summary().active_ppm == -7990);
+        assert(!memcmp(&accepted, &rtc_clock_retained.accounting.calibration, sizeof accepted));
+        reboot_runtime();
+        initialize_runtime(false, true);
+        view = rtc_clock_history_owner_summary();
+        assert(view.active_ppm == -7990 && view.coefficient_saved);
+        assert(view.calibration.quality == RTC_CLOCK_CALIBRATION_LEGACY);
+        assert(!view.calibration.uncertainty_valid && !view.calibration.evidence_sequence);
+    }
+}
+
+static void check_calibration_semantic_validation(void) {
+    reset_all();
+    rtc_clock_boot(false, true);
+    rtc_clock_accounting_t *accounting = &rtc_clock_retained.accounting;
+    const rtc_clock_accounting_t baseline = *accounting;
+    for (unsigned kind = 0; kind < 8; ++kind) {
+        *accounting = baseline;
+        if (kind == 0) accounting->calibration.quality = 4;
+        if (kind == 1) accounting->calibration.uncertainty_valid = 2;
+        if (kind == 2) accounting->calibration.uncertainty_millippm = 1;
+        if (kind == 3) accounting->calibration.evidence_sequence = 1;
+        if (kind == 4) accounting->calibration.estimator_version = 3;
+        if (kind == 5) { accounting->active_qualified = 1; accounting->calibration.quality = 2; }
+        if (kind == 6) { accounting->calibration.evidence_sequence = 1; accounting->calibration.evidence_utc_us = 1; }
+        if (kind == 7) accounting->active_qualified = 1;
+        seal_accounting();
+        assert(!accounting_valid());
+    }
+    *accounting = baseline;
+    assert(accounting_valid());
 }
 
 static void check_actual_maintenance_cadence(void) {
@@ -1578,6 +1694,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1], "populated")) check_history_populated_init_recovery();
         else if (!strcmp(argv[1], "shadow")) check_history_shadow_reload_and_age();
         else if (!strcmp(argv[1], "recovery")) check_variable_history_recovery_activation();
+        else if (!strcmp(argv[1], "refinement")) check_recent_history_activation_and_provenance();
+        else if (!strcmp(argv[1], "metadata")) check_calibration_semantic_validation();
         else if (!strcmp(argv[1], "cadence")) check_actual_maintenance_cadence();
         else return 2;
         reboot_runtime();
@@ -1589,6 +1707,8 @@ int main(int argc, char **argv) {
     check_light_sleep_failed_correction_cannot_restore_trust();
     check_light_sleep_sdk_libc_offset();
     check_variable_history_recovery_activation();
+    check_recent_history_activation_and_provenance();
+    check_calibration_semantic_validation();
     check_actual_maintenance_cadence();
     check_history_unavailable_coefficient_recovery();
     check_history_recovery_keeps_new_coefficient();

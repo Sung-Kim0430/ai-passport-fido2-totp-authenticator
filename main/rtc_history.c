@@ -202,6 +202,78 @@ static bool sample_inlier(const rtc_history_estimate_sample_t *sample,
     return fabs(sample->ppm - median->ppm) <= tolerance;
 }
 
+static bool replay_error(const rtc_history_record_t *row, int32_t ppm, double *error)
+{
+    rtc_drift_ratio_t carry = {0};
+    rtc_drift_time_t corrected;
+    if (!rtc_drift_scale_time(&row->raw, ppm, &carry, &corrected)) return false;
+    *error = fabs((double)corrected.us - (double)(row->utc_delta_us - row->awake_delta_us) +
+        (double)corrected.fraction_q19 / RTC_DRIFT_Q19);
+    return isfinite(*error);
+}
+
+static void recent_refinement(const rtc_history_t *history, uint64_t now_utc_us,
+    int32_t baseline_ppm, const rtc_history_estimate_sample_t recent[3],
+    rtc_history_estimate_t *estimate)
+{
+    if (estimate->result != RTC_HISTORY_ESTIMATE_INCONSISTENT) return;
+    const uint64_t max_age = UINT64_C(7) * 86400 * 1000000;
+    rtc_history_record_t rows[3];
+    for (size_t i = 0; i < 3; ++i) {
+        if (!rtc_history_get(history, recent[i].row_index, &rows[i]) ||
+            rows[i].utc_end_us > now_utc_us || now_utc_us - rows[i].utc_end_us > max_age) return;
+    }
+    /* These must be the actual newest same-source rows, including exclusions. */
+    size_t remaining = 3;
+    for (size_t i = history->count; i > 0 && remaining; --i) {
+        if (row_at(history, i - 1)->source != rows[2].source) continue;
+        if (i - 1 != recent[remaining - 1].row_index) return;
+        --remaining;
+    }
+    if (remaining || fabs(recent[0].ppm - recent[1].ppm) >
+        fmax(200.0, recent[0].uncertainty_ppm + recent[1].uncertainty_ppm)) return;
+
+    const double weight = recent[0].weight + recent[1].weight;
+    if (!isfinite(weight) || weight <= 0.0) return;
+    const double candidate = round(recent[0].ppm +
+        recent[1].weight / weight * (recent[1].ppm - recent[0].ppm));
+    if (!isfinite(candidate) || candidate < -20000 || candidate > 20000) return;
+    const double training_uncertainty = fmax(
+        recent[0].uncertainty_ppm + fabs(recent[0].ppm - candidate),
+        recent[1].uncertainty_ppm + fabs(recent[1].ppm - candidate));
+    if (fabs(recent[2].ppm - candidate) >
+        fmax(200.0, training_uncertainty + recent[2].uncertainty_ppm)) return;
+    /* Cover every observed window; low weight never erases its allowance. */
+    const double uncertainty = fmax(training_uncertainty,
+        recent[2].uncertainty_ppm + fabs(recent[2].ppm - candidate));
+    for (size_t i = 0; i < 2; ++i) {
+        double old_error, new_error;
+        if (!replay_error(&rows[i], baseline_ppm, &old_error) ||
+            !replay_error(&rows[i], (int32_t)candidate, &new_error)) return;
+        const double allowance = 2.0 * rows[i].combined_uncertainty_us +
+            (double)(rows[i].utc_delta_us - rows[i].awake_delta_us) / 1000000.0;
+        if (new_error > old_error + allowance) return;
+    }
+    double baseline_error, candidate_error;
+    if (!replay_error(&rows[2], baseline_ppm, &baseline_error) ||
+        !replay_error(&rows[2], (int32_t)candidate, &candidate_error)) return;
+    const double bridge = (double)(rows[2].utc_delta_us - rows[2].awake_delta_us);
+    const double margin = 2.0 * rows[2].combined_uncertainty_us +
+        uncertainty * bridge / (1000000.0 + candidate);
+    const double improvement = baseline_error - candidate_error;
+    if (improvement <= margin || improvement < 0.2 * baseline_error ||
+        improvement < bridge / 1000000.0) return;
+
+    estimate->result = RTC_HISTORY_ESTIMATE_RECENT_READY;
+    estimate->inliers = 2;
+    estimate->ppm = candidate;
+    estimate->uncertainty_ppm = uncertainty;
+    estimate->holdout_present = true;
+    estimate->holdout_improved = true;
+    estimate->holdout_baseline_error_us = baseline_error;
+    estimate->holdout_candidate_error_us = candidate_error;
+}
+
 static void recent_recovery(const rtc_history_t *history, uint64_t now_utc_us,
     int32_t baseline_ppm, const rtc_history_estimate_sample_t *training,
     const rtc_history_estimate_sample_t *holdout, rtc_history_estimate_t *estimate)
@@ -288,6 +360,8 @@ bool rtc_history_estimate(const rtc_history_t *history, uint32_t source,
             (double)RTC_HISTORY_RECENCY_HALF_LIFE_US);
         sample->weight = (double)bridge * recency / (1.0 + sample->uncertainty_ppm);
         sample->row_index = i;
+        value.evidence_sequence = row.sequence;
+        value.evidence_utc_us = row.utc_end_us;
         ++value.samples;
     }
     if (!value.samples) {
@@ -304,6 +378,9 @@ bool rtc_history_estimate(const rtc_history_t *history, uint32_t source,
     /* Preserve chronological endpoints before the weighted-median sort. */
     const rtc_history_estimate_sample_t previous = workspace->samples[value.samples - 2];
     const rtc_history_estimate_sample_t latest = workspace->samples[value.samples - 1];
+    rtc_history_estimate_sample_t recent[3];
+    if (value.samples >= 3)
+        memcpy(recent, &workspace->samples[value.samples - 3], sizeof recent);
     value.holdout_present = value.samples >= 3;
     const size_t training = value.samples - (value.holdout_present ? 1 : 0);
     sort_samples(workspace->samples, training);
@@ -361,6 +438,7 @@ bool rtc_history_estimate(const rtc_history_t *history, uint32_t source,
     }
     if (!isfinite(value.ppm) || !isfinite(value.uncertainty_ppm) ||
         value.ppm < -20000.0 || value.ppm > 20000.0) return false;
+    if (value.samples >= 3) recent_refinement(history, now_utc_us, baseline_ppm, recent, &value);
     recent_recovery(history, now_utc_us, baseline_ppm, &previous, &latest, &value);
     *estimate = value;
     return true;

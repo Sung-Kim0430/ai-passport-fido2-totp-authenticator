@@ -228,6 +228,40 @@ async function historyTests() {
   assert.match(elements.get('rtcSummary').textContent,/多窗口估计 READY/);
   setup(100,(p,c)=>{if(c)throw new Error('409 stale');});saved=undefined;
   await run('rtcHistoryAction(true)');assert.equal(saved,undefined);assert.match(elements.get('error').textContent,/409 stale/);
+  const calibration={quality:3,estimator_version:3,evidence_sequence:'3',evidence_utc_us:'1700000000000000',uncertainty_millippm:872000,uncertainty_valid:true,secret:'SECRET',epoch:'PRIVATE'};
+  const calibrationPage=p=>Object.assign(p.summary,{active_ppm:-7165,calibration:{...calibration},coefficient_saved:false,coefficient_save_blocked:false,saved_ppm:-870,coefficient_save_budget_us:'86400000000'});
+  setup(5,calibrationPage);
+  const calibrated=await run('readRtcHistory(true)');
+  assert.equal(calibrated.summary.calibration?.quality,3);
+  assert.equal(calibrated.summary.calibration.evidence_sequence,'3');
+  assert.equal(calibrated.summary.coefficient_save_budget_us,'86400000000');
+  assert.equal(calibrated.summary.coefficient_saved,false);
+  assert.equal(JSON.stringify(calibrated).includes('SECRET'),false);
+  assert.equal(JSON.stringify(calibrated).includes('PRIVATE'),false);
+  context.calibratedHistory=calibrated;run('renderRtcHistory(calibratedHistory)');
+  assert.match(elements.get('rtcSummary').textContent,/RECOVERY/);
+  assert.match(elements.get('rtcSummary').textContent,/872/);
+  for(const mutate of [
+    c=>c.quality=4,c=>c.quality=1.5,c=>c.uncertainty_millippm=-1,c=>c.uncertainty_valid='true',
+    c=>c.evidence_sequence=9007199254740992,c=>c.evidence_utc_us='18446744073709551616',
+    c=>delete c.estimator_version,c=>c.estimator_version=2,c=>c.evidence_sequence='0',
+    c=>c.evidence_utc_us='1',c=>c.uncertainty_valid=false,c=>c.uncertainty_millippm=1.5
+  ]){
+    setup(5,p=>{calibrationPage(p);mutate(p.summary.calibration);});
+    await assert.rejects(()=>run('readRtcHistory(true)'));
+  }
+  for(const mutate of [s=>s.calibration=null,s=>delete s.calibration,s=>s.coefficient_saved=true,
+    s=>s.saved_ppm=20001,s=>s.saved_ppm=0.5,s=>delete s.saved_ppm,
+    s=>s.coefficient_save_budget_us='86400000001',s=>s.coefficient_save_blocked=1]) {
+    setup(5,p=>{calibrationPage(p);mutate(p.summary);});
+    await assert.rejects(()=>run('readRtcHistory(true)'));
+  }
+  setup(5,p=>{calibrationPage(p);p.summary.saved_ppm=null;});
+  assert.equal((await run('readRtcHistory(true)')).summary.saved_ppm,null);
+  setup(5,p=>{calibrationPage(p);p.summary.saved_ppm=-7165;p.summary.coefficient_saved=true;});
+  assert.equal((await run('readRtcHistory(true)')).summary.coefficient_saved,true);
+  setup(5);await run('rtcHistoryAction(false)'); /* Older firmware remains readable. */
+  assert.match(elements.get('rtcSummary').textContent,/未知/);
   context.URL=URL;
   context.request=realRequest;
   console.log('Web history bounds, generation, unlock/session, string widths and secret allowlist: PASS');

@@ -212,6 +212,7 @@ provide reference material. Choose the entry that matches your task.
 | [Chinese fonts](/docs/development/engineering/lvgl-chinese-fonts.md) | Glyph coverage, widget font selection, and blank-text troubleshooting |
 | [Wi-Fi provisioning](/docs/development/engineering/wifi-provisioning.md) | Bluetooth provisioning reference and companion mini program |
 | [RTC calibration design and plan](/docs/assets/rtc-calibration-design.md) | Authenticator temperature learning, periodic maintenance, wake races, and validation boundaries |
+| [RTC calibration refinement plan](/docs/assets/rtc-calibration-refinement-plan.md) | Recent-window holdout refinement, active evidence and coefficient persistence diagnostics |
 | [Phone time synchronization plan](/docs/assets/phone-time-sync-plan.md) | Millisecond references, repeated delay measurement, uncertainty and acceptance |
 | [Automatic light sleep design](/docs/assets/light-sleep-design.md) · [implementation plan](/docs/assets/light-sleep-plan.md) | Idle sleep, RTC accounting, backlight continuity, and verification |
 | [Community projects and experience](/docs/reference/README.md) | Playbooks and reusable knowledge under `docs/reference/<username>/` |

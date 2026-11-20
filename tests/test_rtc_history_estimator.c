@@ -395,6 +395,139 @@ static bool recovery_cannot_skip_newest_evidence(void)
     return true;
 }
 
+static uint64_t recent_cohort(rtc_history_t *history, unsigned older, int sign,
+    const int rates[3], uint64_t uncertainty)
+{
+    rtc_history_init(history);
+    uint64_t end = 0;
+    for (unsigned i = 0; i < older + 3; ++i) {
+        const int rate = i < older ? 870 : rates[i - older];
+        rtc_history_record_t row = record(i + 1, sign * rate, 25 * HOUR_US, uncertainty);
+        CHECK(rtc_history_append(history, &row));
+        end = row.utc_end_us;
+    }
+    return end;
+}
+
+static bool recent_refinement_outgrows_old_majority(void)
+{
+    const int rates[3] = {7989, 7990, 7988};
+    for (int sign = -1; sign <= 1; sign += 2) {
+        for (unsigned older = 28; older <= 98; older += 70) {
+            rtc_history_t history;
+            const uint64_t now = recent_cohort(&history, older, sign, rates, 1000000);
+            rtc_history_estimate_workspace_t workspace;
+            rtc_history_estimate_t estimate;
+            CHECK(rtc_history_estimate(&history, 2, now, sign * 7165, &workspace, &estimate));
+            CHECK(estimate.result == 4); /* RECENT_READY; preserve existing wire enum values. */
+            CHECK(estimate.holdout_present && estimate.holdout_improved && estimate.inliers == 2);
+            CHECK(estimate.ppm == sign * 7990 && estimate.uncertainty_ppm >= 11.0);
+            CHECK(estimate.holdout_candidate_error_us < 200000);
+            const double expected_old = 25.0 * HOUR_US * 823 / (1000000 + sign * 7165);
+            CHECK(fabs(estimate.holdout_baseline_error_us - expected_old) < 1.0);
+            const int32_t deployed = (int32_t)estimate.ppm;
+            CHECK(rtc_history_estimate(&history, 2, now, deployed, &workspace, &estimate));
+            CHECK(!estimate.holdout_improved); /* One triple cannot ratchet the active rate. */
+        }
+    }
+    return true;
+}
+
+static bool recent_refinement_holds_out_newest(void)
+{
+    double chosen = 0;
+    for (int latest = 7965; latest <= 8015; latest += 25) {
+        rtc_history_t history;
+        const int rates[3] = {7989, 7990, latest};
+        const uint64_t now = recent_cohort(&history, 28, -1, rates, 1000000);
+        rtc_history_estimate_workspace_t workspace;
+        rtc_history_estimate_t estimate;
+        CHECK(rtc_history_estimate(&history, 2, now, -7165, &workspace, &estimate));
+        CHECK(estimate.result == 4 && estimate.holdout_improved);
+        CHECK(estimate.ppm == -7990);
+        if (chosen) CHECK(estimate.ppm == chosen);
+        chosen = estimate.ppm;
+        /* The uncertainty includes observed variation; it is not a mean's SE. */
+        CHECK(estimate.uncertainty_ppm >= fabs(latest + estimate.ppm) + 11.0);
+    }
+    return true;
+}
+
+static bool recent_refinement_age_rounding_and_fraction(void)
+{
+    const int rates[3] = {7989,7990,7988};
+    rtc_history_t history;
+    const uint64_t end = recent_cohort(&history, 28, -1, rates, 1000000);
+    history.rows[28].raw.fraction_q19 = RTC_DRIFT_Q19 - 1;
+    history.rows[29].raw.fraction_q19 = RTC_DRIFT_Q19 / 2;
+    history.rows[30].raw.fraction_q19 = RTC_DRIFT_Q19 - 1;
+    rtc_history_estimate_workspace_t workspace;
+    rtc_history_estimate_t estimate;
+    const uint64_t limit = history.rows[28].utc_end_us + 7 * 24 * HOUR_US;
+    CHECK(limit >= end);
+    CHECK(rtc_history_estimate(&history, 2, limit, -7165, &workspace, &estimate));
+    CHECK(estimate.result == RTC_HISTORY_ESTIMATE_RECENT_READY && estimate.ppm == -7990);
+    rtc_drift_ratio_t ratio = {0};
+    rtc_drift_time_t corrected;
+    CHECK(rtc_drift_scale_time(&history.rows[30].raw, -7990, &ratio, &corrected));
+    const double expected = fabs((double)corrected.us - 25.0 * HOUR_US +
+        (double)corrected.fraction_q19 / RTC_DRIFT_Q19);
+    CHECK(fabs(estimate.holdout_candidate_error_us - expected) < 0.000001);
+    CHECK(rtc_history_estimate(&history, 2, limit + 1, -7165, &workspace, &estimate));
+    CHECK(estimate.result != RTC_HISTORY_ESTIMATE_RECENT_READY);
+    return true;
+}
+
+static bool recent_refinement_rejects_inconsistent_or_uncertain(void)
+{
+    const int rates[][3] = {{7500,8100,7990}, {7990,7989,7400}, {7989,7990,7988}};
+    for (unsigned kind = 0; kind < 3; ++kind) {
+        rtc_history_t history;
+        const uint64_t now = recent_cohort(&history, 28, -1, rates[kind], kind == 2 ? 8000000 : 1000000);
+        rtc_history_estimate_workspace_t workspace;
+        rtc_history_estimate_t estimate;
+        CHECK(rtc_history_estimate(&history, 2, now, kind == 2 ? -7975 : -7165, &workspace, &estimate));
+        CHECK(estimate.result != 4 && !estimate.holdout_improved);
+    }
+    return true;
+}
+
+static bool recent_refinement_cannot_skip_or_reuse_stale_rows(void)
+{
+    const int rates[3] = {7989,7990,7988};
+    for (unsigned kind = 0; kind < 6; ++kind) {
+        rtc_history_t history;
+        uint64_t now = recent_cohort(&history, 28, -1, rates, 1000000);
+        if (kind < 3) {
+            rtc_history_record_t newer = record(32, -7165, 25 * HOUR_US, 1000000);
+            if (kind == 0) { /* A future newer record excludes an otherwise favorable triple. */
+                CHECK(rtc_history_append(&history, &newer));
+            } else { /* An overlapping latest or penultimate row cannot be skipped. */
+                newer.epoch = 2;
+                newer.utc_end_us -= 6 * HOUR_US;
+                CHECK(rtc_history_append(&history, &newer));
+                now = newer.utc_end_us;
+                if (kind == 2) {
+                    rtc_history_record_t last = record(33, -7990, 25 * HOUR_US, 1000000);
+                    CHECK(rtc_history_append(&history, &last));
+                    now = last.utc_end_us;
+                }
+            }
+        } else if (kind == 3) now += 8 * 24 * HOUR_US;
+        else if (kind == 4) history.rows[30].source = 0;
+        else {
+            /* A fresh latest window cannot conceal a stale first training window. */
+            history.rows[30].utc_end_us += 6 * 24 * HOUR_US;
+            now = history.rows[30].utc_end_us;
+        }
+        rtc_history_estimate_workspace_t workspace;
+        rtc_history_estimate_t estimate;
+        CHECK(rtc_history_estimate(&history, 2, now, -7165, &workspace, &estimate));
+        CHECK(estimate.result != 4 && !estimate.holdout_improved);
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     const struct { const char *name; bool (*run)(void); } tests[] = {
@@ -413,7 +546,12 @@ int main(int argc, char **argv)
         {"recent_independent_recovery", recent_independent_recovery},
         {"recovery_rejects_unsafe_evidence", recovery_rejects_unsafe_evidence},
         {"recovery_freshness_and_old_majority", recovery_freshness_and_old_majority},
-        {"recovery_cannot_skip_newest_evidence", recovery_cannot_skip_newest_evidence}
+        {"recovery_cannot_skip_newest_evidence", recovery_cannot_skip_newest_evidence},
+        {"recent_refinement_outgrows_old_majority", recent_refinement_outgrows_old_majority},
+        {"recent_refinement_holds_out_newest", recent_refinement_holds_out_newest},
+        {"recent_refinement_age_rounding_and_fraction", recent_refinement_age_rounding_and_fraction},
+        {"recent_refinement_rejects_inconsistent_or_uncertain", recent_refinement_rejects_inconsistent_or_uncertain},
+        {"recent_refinement_cannot_skip_or_reuse_stale_rows", recent_refinement_cannot_skip_or_reuse_stale_rows}
     };
     for (size_t i = 0; i < sizeof tests / sizeof tests[0]; ++i) {
         if (argc == 2 && strcmp(argv[1], tests[i].name) != 0) continue;

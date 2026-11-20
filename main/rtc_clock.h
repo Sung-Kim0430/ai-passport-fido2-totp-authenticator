@@ -5,6 +5,22 @@
 #include <stdint.h>
 #include "rtc_history_store.h"
 
+typedef enum {
+    RTC_CLOCK_CALIBRATION_NONE = 0,
+    RTC_CLOCK_CALIBRATION_LEGACY,
+    RTC_CLOCK_CALIBRATION_STABLE,
+    RTC_CLOCK_CALIBRATION_RECOVERY
+} rtc_clock_calibration_quality_t;
+
+typedef struct {
+    uint32_t quality;
+    uint32_t estimator_version;
+    uint64_t evidence_sequence;
+    uint64_t evidence_utc_us;
+    uint32_t uncertainty_millippm;
+    uint32_t uncertainty_valid;
+} rtc_clock_calibration_t;
+
 typedef struct {
     uint64_t generation;
     uint64_t accepted_sequence;
@@ -21,6 +37,12 @@ typedef struct {
     bool active_qualified;
     int32_t legacy_candidate_ppm;
     bool legacy_candidate_qualified;
+    rtc_clock_calibration_t calibration;
+    bool coefficient_saved;
+    bool coefficient_save_blocked;
+    int32_t saved_ppm;
+    bool saved_ppm_valid;
+    uint64_t coefficient_save_budget_us;
     rtc_history_estimate_t shadow;
 } rtc_clock_history_summary_t;
 

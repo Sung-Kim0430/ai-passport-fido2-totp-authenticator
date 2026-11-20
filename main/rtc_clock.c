@@ -207,18 +207,42 @@ static void history_refresh(void)
     const bool stable = estimate.result == RTC_HISTORY_ESTIMATE_READY && estimate.inliers >= 2;
     const bool recovery = estimate.result == RTC_HISTORY_ESTIMATE_RECOVERY &&
         a->active_qualified && estimate.holdout_present && estimate.holdout_improved;
+    const bool recent = estimate.result == RTC_HISTORY_ESTIMATE_RECENT_READY &&
+        a->active_qualified && estimate.holdout_present && estimate.holdout_improved;
     if (s_clock.boot_done && s_clock.supported && !rtc_clock_retained.history.count &&
         rtc_clock_retained.history.accepted_sequence == rtc_clock_retained.history.durable_sequence &&
         rtc_clock_platform_source() == s_clock.source &&
-        (stable || recovery) && isfinite(estimate.ppm)) {
+        (stable || recovery || recent) && isfinite(estimate.ppm) &&
+        estimate.evidence_sequence > a->calibration.evidence_sequence &&
+        estimate.evidence_utc_us >= a->calibration.evidence_utc_us) {
         const long long rounded = llround(estimate.ppm);
         if (rounded >= -20000 && rounded <= 20000) {
             const int32_t candidate = (int32_t)rounded;
             const bool initial = stable && !a->active_qualified && estimate.uncertainty_ppm <= 100.0;
             const bool refine = a->active_qualified && estimate.holdout_improved && candidate != a->active_ppm;
             if (initial || refine) {
+                double uncertainty = estimate.uncertainty_ppm + fabs(estimate.ppm - candidate);
+                for (size_t index = 0; index < s_clock.history->ring.count; ++index) {
+                    rtc_history_record_t row;
+                    double rate;
+                    if (rtc_history_get(&s_clock.history->ring, index, &row) &&
+                        row.sequence == estimate.evidence_sequence && rtc_history_rate_ppm(&row, &rate)) {
+                        const double allowance = (double)row.combined_uncertainty_us * 1000000.0 /
+                            (double)(row.utc_delta_us - row.awake_delta_us);
+                        uncertainty = fmax(uncertainty, allowance + fabs(rate - candidate));
+                    }
+                }
+                const double milli = ceil(uncertainty * 1000.0);
+                if (!isfinite(milli) || milli < 0 || milli > UINT32_MAX) return;
                 a->active_ppm = candidate;
                 a->active_qualified = 1;
+                a->calibration = (rtc_clock_calibration_t){
+                    .quality = recovery ? RTC_CLOCK_CALIBRATION_RECOVERY : RTC_CLOCK_CALIBRATION_STABLE,
+                    .estimator_version = estimate.version,
+                    .evidence_sequence = estimate.evidence_sequence,
+                    .evidence_utc_us = estimate.evidence_utc_us,
+                    .uncertainty_millippm = (uint32_t)milli, .uncertainty_valid = 1
+                };
                 a->learning.ppm = candidate;
                 a->learning.qualified = true;
                 seal_accounting();
@@ -315,6 +339,11 @@ rtc_clock_history_summary_t rtc_clock_history_owner_summary(void)
         .ready = ready, .store_status = s_clock.history_status, .save_result = s_clock.history_save_result,
         .active_ppm = a->active_ppm, .active_qualified = a->active_qualified != 0,
         .legacy_candidate_ppm = a->learning.ppm, .legacy_candidate_qualified = a->learning.qualified,
+        .calibration = a->calibration,
+        .coefficient_saved = a->active_qualified && s_clock.coefficient_saved && s_clock.saved_ppm == a->active_ppm,
+        .coefficient_save_blocked = s_clock.coefficient_blocked,
+        .saved_ppm = s_clock.saved_ppm, .saved_ppm_valid = s_clock.coefficient_saved,
+        .coefficient_save_budget_us = a->coefficient_budget_us,
         .shadow = s_clock.history_shadow
     };
 }
@@ -348,6 +377,18 @@ static bool accounting_valid(void)
 {
     const rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
     if (a->checksum != rtc_clock_checksum(a, offsetof(rtc_clock_accounting_t, checksum))) return false;
+    const rtc_clock_calibration_t *calibration = &a->calibration;
+    if (calibration->quality > RTC_CLOCK_CALIBRATION_RECOVERY || calibration->uncertainty_valid > 1 ||
+        (!calibration->uncertainty_valid && calibration->uncertainty_millippm) ||
+        (a->active_qualified != (calibration->quality != RTC_CLOCK_CALIBRATION_NONE)) ||
+        ((calibration->evidence_sequence == 0) != (calibration->evidence_utc_us == 0)) ||
+        (calibration->evidence_utc_us && (calibration->evidence_utc_us < RTC_HISTORY_UTC_MIN_US ||
+            calibration->evidence_utc_us > RTC_HISTORY_UTC_MAX_US))) return false;
+    if (calibration->quality <= RTC_CLOCK_CALIBRATION_LEGACY) {
+        if (calibration->estimator_version || calibration->uncertainty_valid ||
+            (calibration->quality == RTC_CLOCK_CALIBRATION_NONE && calibration->evidence_sequence)) return false;
+    } else if (calibration->estimator_version != RTC_HISTORY_ESTIMATE_VERSION ||
+        !calibration->uncertainty_valid || !calibration->evidence_sequence) return false;
     return a->version == RTC_CLOCK_VERSION && a->source == s_clock.source && a->continuity &&
         rtc_drift_time_valid(&a->raw_total) && rtc_drift_time_valid(&a->corrected_total) &&
         a->awake_total_us <= RTC_DRIFT_MAX_ELAPSED_US && a->utc_phase_q19 < RTC_DRIFT_Q19 &&
@@ -394,6 +435,7 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
         a->continuity = 1;
         a->active_ppm = s_clock.saved_ppm;
         a->active_qualified = s_clock.coefficient_saved;
+        a->calibration.quality = s_clock.coefficient_saved ? RTC_CLOCK_CALIBRATION_LEGACY : RTC_CLOCK_CALIBRATION_NONE;
         rtc_drift_learning_reset(&a->learning, a->source, a->continuity,
             s_clock.saved_ppm, s_clock.coefficient_saved);
         seal_accounting();
@@ -1077,7 +1119,16 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
         const bool unavailable = s_clock.history_status == RTC_HISTORY_STORE_IO_ERROR;
         const bool fallback = unavailable && !evidence_dropped && capture_history &&
             next.learning_reason == RTC_DRIFT_LEARN_PUBLISHED;
-        if (eligible && next.learning.qualified && (!next.active_qualified || fallback)) {
+        if (eligible && next.learning.qualified && (!next.active_qualified || fallback) &&
+            (!fallback || (history_row.sequence > next.calibration.evidence_sequence &&
+                history_row.utc_end_us >= next.calibration.evidence_utc_us))) {
+            if (!next.active_qualified || next.active_ppm != next.learning.ppm) {
+                next.calibration = (rtc_clock_calibration_t){
+                    .quality = RTC_CLOCK_CALIBRATION_LEGACY,
+                    .evidence_sequence = capture_history ? history_row.sequence : 0,
+                    .evidence_utc_us = capture_history ? history_row.utc_end_us : 0
+                };
+            }
             next.active_ppm = next.learning.ppm;
             next.active_qualified = 1;
         }

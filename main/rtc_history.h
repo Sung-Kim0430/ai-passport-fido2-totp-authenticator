@@ -60,7 +60,7 @@ bool rtc_history_get(const rtc_history_t *history, size_t index, rtc_history_rec
 bool rtc_history_page(const rtc_history_t *history, uint64_t generation, size_t cursor,
     rtc_history_page_t *page);
 
-#define RTC_HISTORY_ESTIMATE_VERSION 2
+#define RTC_HISTORY_ESTIMATE_VERSION 3
 #define RTC_HISTORY_EVIDENCE_MAX_AGE_US (UINT64_C(90) * 86400 * 1000000)
 #define RTC_HISTORY_RECENCY_HALF_LIFE_US (UINT64_C(30) * 86400 * 1000000)
 
@@ -69,7 +69,9 @@ typedef enum {
     RTC_HISTORY_ESTIMATE_INCONSISTENT,
     RTC_HISTORY_ESTIMATE_READY,
     /* Independently validated recovery of an existing rate, not a stable fit. */
-    RTC_HISTORY_ESTIMATE_RECOVERY
+    RTC_HISTORY_ESTIMATE_RECOVERY,
+    /* Recent consistent training pair with an independent newest holdout. */
+    RTC_HISTORY_ESTIMATE_RECENT_READY
 } rtc_history_estimate_result_t;
 
 typedef struct {
@@ -96,6 +98,8 @@ typedef struct {
     double holdout_candidate_error_us;
     bool holdout_present;
     bool holdout_improved;
+    uint64_t evidence_sequence;
+    uint64_t evidence_utc_us;
 } rtc_history_estimate_t;
 
 bool rtc_history_estimate(const rtc_history_t *history, uint32_t source,

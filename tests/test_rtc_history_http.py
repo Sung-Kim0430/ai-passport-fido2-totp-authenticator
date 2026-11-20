@@ -34,7 +34,7 @@ typedef struct { const char *query; } httpd_req_t;
 #define portEXIT_CRITICAL(p) ((void)(p), --locks)
 #define pdMS_TO_TICKS(ms) (ms)
 static int locks, s_snapshot_lock, code, calls, mode;
-static bool in_owner, real_pages;
+static bool in_owner, real_pages, metadata_wide;
 static rtc_history_t history;
 static void lifecycle_during_owner(void);
 static struct { bool unlocked; struct { uint32_t learning_reason; } clock; } s_snapshot = {true,{13}};
@@ -57,7 +57,7 @@ rtc_clock_history_summary_t rtc_clock_history_owner_summary(void) {
  assert(in_owner && !locks);calls++;
  if(mode==5)lifecycle_during_owner();
  if(real_pages)return (rtc_clock_history_summary_t){.ready=true,.generation=history.generation,.durable_count=history.count};
- rtc_clock_history_summary_t s={0};s.ready=mode!=4 && mode!=6;s.generation=UINT64_MAX;s.accepted_sequence=UINT64_MAX;s.durable_sequence=UINT64_MAX-1;s.dropped=UINT64_MAX;s.save_budget_us=UINT64_MAX;s.pending_count=UINT32_MAX;s.durable_count=UINT32_MAX;s.flags=UINT32_MAX;s.store_status=mode==4?RTC_HISTORY_STORE_IO_ERROR:mode==6?RTC_HISTORY_STORE_BLOCKED:INT32_MAX;s.save_result=INT32_MAX;s.legacy_candidate_ppm=INT32_MIN;s.active_ppm=-870;s.active_qualified=true;s.shadow.ppm=INFINITY;s.shadow.result=RTC_HISTORY_ESTIMATE_READY;s.shadow.version=UINT32_MAX;s.shadow.source=UINT32_MAX;s.shadow.samples=UINT32_MAX;s.shadow.inliers=UINT32_MAX;s.shadow.excluded=UINT32_MAX;s.shadow.uncertainty_ppm=1.7976931348623157e308;s.shadow.holdout_baseline_error_us=-1.7976931348623157e308;s.shadow.holdout_candidate_error_us=1.7976931348623157e308;return s;
+ rtc_clock_history_summary_t s={0};s.ready=mode!=4 && mode!=6;s.generation=UINT64_MAX;s.accepted_sequence=UINT64_MAX;s.durable_sequence=UINT64_MAX-1;s.dropped=UINT64_MAX;s.save_budget_us=UINT64_MAX;s.pending_count=UINT32_MAX;s.durable_count=UINT32_MAX;s.flags=UINT32_MAX;s.store_status=mode==4?RTC_HISTORY_STORE_IO_ERROR:mode==6?RTC_HISTORY_STORE_BLOCKED:INT32_MAX;s.save_result=INT32_MAX;s.legacy_candidate_ppm=INT32_MIN;s.active_ppm=-870;s.active_qualified=true;s.shadow.ppm=INFINITY;s.shadow.result=RTC_HISTORY_ESTIMATE_READY;s.shadow.version=UINT32_MAX;s.shadow.source=UINT32_MAX;s.shadow.samples=UINT32_MAX;s.shadow.inliers=UINT32_MAX;s.shadow.excluded=UINT32_MAX;s.shadow.uncertainty_ppm=1.7976931348623157e308;s.shadow.holdout_baseline_error_us=-1.7976931348623157e308;s.shadow.holdout_candidate_error_us=1.7976931348623157e308;if(metadata_wide){s.calibration=(rtc_clock_calibration_t){UINT32_MAX,UINT32_MAX,UINT64_MAX,UINT64_MAX,UINT32_MAX,1};s.saved_ppm_valid=true;s.saved_ppm=INT32_MIN;s.coefficient_save_blocked=true;s.coefficient_save_budget_us=UINT64_MAX;}return s;
 }
 bool rtc_clock_history_owner_page(uint64_t generation,size_t cursor,rtc_history_page_t *p) {
  assert(in_owner && !locks);if(real_pages)return rtc_history_page(&history,generation,cursor,p);assert(generation==UINT64_MAX);memset(p,0,sizeof *p);p->generation=generation;p->total=100;p->count=cursor<100?5:0;p->cursor=cursor+p->count;
@@ -79,6 +79,7 @@ int main(void) {
  char huge[100];memset(huge,'1',sizeof huge-1);huge[sizeof huge-1]=0;dispatch(huge,400);
  dispatch("generation=1",409);mode=4;dispatch("",503);assert(strstr(output,"RTC_HISTORY_IO_ERROR"));mode=6;dispatch("",503);assert(strstr(output,"RTC_HISTORY_BLOCKED"));mode=3;dispatch("",423);
  mode=1;dispatch("",504);mode=0;dispatch("",200);puts(output);
+ metadata_wide=true;dispatch("",200);puts(output);metadata_wide=false;
  dispatch("cursor=95&generation=18446744073709551615",200);assert(strstr(output,"\"cursor\":95"));
  dispatch("cursor=100&generation=18446744073709551615",200);assert(strstr(output,"\"rows\":[]"));
  mode=2;dispatch("",503);mode=0;dispatch("",503);history_mailbox_reset(true);dispatch("",200);
@@ -118,12 +119,24 @@ int main(void) {
             self.assertEqual(result.returncode, 0, result.stderr)
             print(result.stderr.strip())
             import json
-            data = json.loads(result.stdout)
+            data, wide = map(json.loads, result.stdout.splitlines())
+            self.assertIsNone(data['summary']['saved_ppm'])
+            self.assertEqual(wide['summary']['calibration']['evidence_sequence'], str(2**64-1))
+            self.assertEqual(wide['summary']['calibration']['uncertainty_millippm'], 2**32-1)
+            self.assertEqual(wide['summary']['saved_ppm'], -2**31)
+            self.assertEqual(wide['summary']['coefficient_save_budget_us'], str(2**64-1))
             self.assertEqual(data['generation'], str(2**64-1))
             self.assertEqual(len(data['rows']), 5)
             self.assertEqual(data['rows'][0]['raw_us'], str(2**64-1))
             self.assertEqual(data['summary']['active_ppm'], -870)
             self.assertEqual(data['summary']['shadow']['ppm'], 0)
+            self.assertIn('calibration', data['summary'])
+            self.assertEqual(data['summary']['calibration']['quality'], 0)
+            self.assertIs(data['summary']['calibration']['uncertainty_valid'], False)
+            self.assertEqual(data['summary']['calibration']['evidence_sequence'], '0')
+            self.assertIs(data['summary']['coefficient_saved'], False)
+            self.assertIs(data['summary']['coefficient_save_blocked'], False)
+            self.assertEqual(data['summary']['coefficient_save_budget_us'], '0')
             for forbidden in ('epoch', 'reference_id', 'session', 'account', 'device_id', 'secret', 'probe', 'wire'):
                 self.assertNotIn(forbidden, result.stdout)
         handler = function_body(source, 'history_handler')

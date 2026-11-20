@@ -298,6 +298,20 @@ static esp_err_t history_send(httpd_req_t *req, const rtc_clock_history_summary_
         (long)s->active_ppm, s->active_qualified ? "true" : "false", (long)s->legacy_candidate_ppm,
         s->legacy_candidate_qualified ? "true" : "false", (unsigned long)reason);
     if (n < 0 || (size_t)n >= sizeof(buf) || httpd_resp_send_chunk(req, buf, n) != ESP_OK) return ESP_FAIL;
+    char saved[16];
+    if (s->saved_ppm_valid) snprintf(saved, sizeof(saved), "%ld", (long)s->saved_ppm);
+    else snprintf(saved, sizeof(saved), "null");
+    const rtc_clock_calibration_t *calibration = &s->calibration;
+    n = snprintf(buf, sizeof(buf),
+        "\"calibration\":{\"quality\":%lu,\"estimator_version\":%lu,\"evidence_sequence\":\"%llu\","
+        "\"evidence_utc_us\":\"%llu\",\"uncertainty_millippm\":%lu,\"uncertainty_valid\":%s},"
+        "\"coefficient_saved\":%s,\"coefficient_save_blocked\":%s,\"saved_ppm\":%s,\"coefficient_save_budget_us\":\"%llu\",",
+        (unsigned long)calibration->quality, (unsigned long)calibration->estimator_version,
+        (unsigned long long)calibration->evidence_sequence, (unsigned long long)calibration->evidence_utc_us,
+        (unsigned long)calibration->uncertainty_millippm, calibration->uncertainty_valid ? "true" : "false",
+        s->coefficient_saved ? "true" : "false", s->coefficient_save_blocked ? "true" : "false",
+        saved, (unsigned long long)s->coefficient_save_budget_us);
+    if (n < 0 || (size_t)n >= sizeof(buf) || httpd_resp_send_chunk(req, buf, n) != ESP_OK) return ESP_FAIL;
     const rtc_history_estimate_t *e = &s->shadow;
     n = snprintf(buf, sizeof(buf),
         "\"shadow\":{\"version\":%lu,\"source\":%lu,\"result\":%u,\"samples\":%u,\"inliers\":%u,\"excluded\":%u,"

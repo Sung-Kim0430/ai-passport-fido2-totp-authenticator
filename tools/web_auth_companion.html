@@ -217,6 +217,29 @@ function rtcSummaryOnly(input) {
     ['durable_count','pending_count','flags','store_status','save_result','active_ppm','legacy_candidate_ppm','learning_reason'],
     ['ready','active_qualified','legacy_candidate_qualified']);
   summary.shadow = rtcPick(input.shadow, [], ['version','source','result','samples','inliers','excluded','ppm','uncertainty_ppm','holdout_baseline_error_us','holdout_candidate_error_us'], ['holdout_present','holdout_improved']);
+  const metadataKeys = ['calibration','coefficient_saved','coefficient_save_blocked','saved_ppm','coefficient_save_budget_us'];
+  if (metadataKeys.some(key => Object.hasOwn(input, key))) {
+    if (!metadataKeys.every(key => Object.hasOwn(input, key))) throw new Error('校准数据缺失');
+    const metadata = rtcPick(input, ['coefficient_save_budget_us'], [], ['coefficient_saved','coefficient_save_blocked']);
+    const calibration = rtcPick(input.calibration, ['evidence_sequence','evidence_utc_us'],
+      ['quality','estimator_version','uncertainty_millippm'], ['uncertainty_valid']);
+    const validInteger = (value, minimum, maximum) => Number.isInteger(value) && value >= minimum && value <= maximum;
+    const end = BigInt(calibration.evidence_utc_us);
+    const sequence = BigInt(calibration.evidence_sequence);
+    if (!validInteger(calibration.quality, 0, 3) || !validInteger(calibration.estimator_version, 0, 3) ||
+        !validInteger(calibration.uncertainty_millippm, 0, 4294967295) ||
+        (!calibration.uncertainty_valid && calibration.uncertainty_millippm !== 0) ||
+        ((sequence === 0n) !== (end === 0n)) ||
+        (end !== 0n && (end < 1577836800000000n || end > 4102444800000000n)) ||
+        summary.active_qualified !== (calibration.quality !== 0) ||
+        (calibration.quality <= 1 && (calibration.estimator_version !== 0 || calibration.uncertainty_valid)) ||
+        (calibration.quality === 0 && sequence !== 0n) ||
+        (calibration.quality >= 2 && (calibration.estimator_version !== 3 || !calibration.uncertainty_valid || sequence === 0n)) ||
+        (input.saved_ppm !== null && !validInteger(input.saved_ppm, -20000, 20000)) ||
+        metadata.coefficient_saved !== (summary.active_qualified && input.saved_ppm !== null && input.saved_ppm === summary.active_ppm) ||
+        BigInt(metadata.coefficient_save_budget_us) > 86400000000n) throw new Error('校准数值无效');
+    Object.assign(summary, metadata, {calibration, saved_ppm:input.saved_ppm});
+  }
   return summary;
 }
 function rtcRowOnly(input) {
@@ -246,10 +269,16 @@ async function readRtcHistory(allPages) {
   }
   throw new Error('历史超出 20 页；未导出部分结果');
 }
+const rtcCalibrationCopy = {"quality_none":"[NONE 未校准] 尚无有效校准数据","quality_legacy":"[LEGACY 兼容] 系数已生效，但缺少完整来源与不确定度","quality_stable":"[STABLE 稳定] 多窗口表现一致，但不作绝对精度保证","quality_recovery":"[RECOVERY 恢复] 由历史回放生成，仍需实机验证","uncertainty_unknown":"[UNKNOWN 未知] 不确定度未评估","coefficient_saved":"[SAVED 已保存] 系数已独立写入存储","coefficient_pending":"[PENDING 待保存] 系数尚未持久化","coefficient_blocked":"因底层存储不支持或版本/格式冲突导致受阻，并非校验未通过。","persistence_unknown":"[UNKNOWN 未知] 存储状态未确认","recent_ready":"[RECENT_READY 就绪] 两窗口训练及第三窗口独立验证就绪，仅可精化已有校准","lab_hint":"历史记录与系数由设备自动分别保存，无需手动提交；RECENT_READY仅为历史验证，不保证实机精度。","active_prefix":"当前生效 (ACTIVE)：","record_prefix":"历史记录 (RECORD)：","coefficient_prefix":"校准系数 (COEFFICIENT)：","evidence_prefix":"数据依据 (EVIDENCE)：","uncertainty_prefix":"不确定度 (UNCERTAINTY)："};
 function renderRtcHistory(data) {
   const s = data.summary;
+  const copy = rtcCalibrationCopy;
+  const quality = s.calibration ? [copy.quality_none,copy.quality_legacy,copy.quality_stable,copy.quality_recovery][s.calibration.quality] : copy.persistence_unknown;
+  const uncertainty = s.calibration?.uncertainty_valid ? `${s.calibration.uncertainty_millippm / 1000} ppm` : copy.uncertainty_unknown;
+  const coefficient = s.coefficient_saved === undefined ? copy.persistence_unknown : s.coefficient_saved ? copy.coefficient_saved : s.coefficient_save_blocked ? copy.coefficient_blocked : copy.coefficient_pending;
   const reasons = {0:'拒绝：无效参考',1:'基线已记录',2:'重复参考',3:'睡眠证据不足',4:'拒绝：区间无效',5:'拒绝：速率越界',6:'拒绝：不确定性过大',7:'候选待确认',8:'拒绝：证据不一致',9:'已发布',10:'拒绝：时钟源变化',11:'拒绝：连续性变化',12:'拒绝：溢出',13:'无新增睡眠证据（清醒期间重复校时不会替换待确认候选）'};
-  $('rtcSummary').textContent = `当前已发布系数 ${s.active_ppm} ppm（${s.active_qualified ? '合格' : '未合格'}）；学习窗口 ${s.legacy_candidate_ppm} ppm（${s.legacy_candidate_qualified ? '合格' : '待确认'}）；${reasons[s.learning_reason] || '未知学习结果'}。已接纳序号 ${s.accepted_sequence} / 已持久化 ${s.durable_sequence}；待保存 ${s.pending_count}；${s.accepted_sequence !== s.durable_sequence || s.pending_count ? '未持久化，立即断电可能丢失' : '已持久化'}；丢弃 ${s.dropped}；存储状态 ${s.store_status} / 保存结果 ${s.save_result}。多窗口估计 ${['PENDING','INCONSISTENT','READY',"RECOVERY（候选在历史回放中改善误差，存在波动，仍待实机复测。）"][s.shadow.result] || '未知'}：${s.shadow.ppm} ± ${s.shadow.uncertainty_ppm} ppm。显示 ${data.rows.length} / ${data.total} 行。`;
+  $('rtcSummary').textContent = `当前已发布系数 ${s.active_ppm} ppm（${quality}）；学习窗口 ${s.legacy_candidate_ppm} ppm（${s.legacy_candidate_qualified ? '合格' : '待确认'}）；${reasons[s.learning_reason] || '未知学习结果'}。已接纳序号 ${s.accepted_sequence} / 已持久化 ${s.durable_sequence}；待保存 ${s.pending_count}；${s.accepted_sequence !== s.durable_sequence || s.pending_count ? '未持久化，立即断电可能丢失' : '已持久化'}；丢弃 ${s.dropped}；存储状态 ${s.store_status} / 保存结果 ${s.save_result}。多窗口估计 ${['PENDING','INCONSISTENT','READY',"RECOVERY（候选在历史回放中改善误差，存在波动，仍待实机复测。）",copy.recent_ready][s.shadow.result] || '未知'}：${s.shadow.ppm} ± ${s.shadow.uncertainty_ppm} ppm。显示 ${data.rows.length} / ${data.total} 行。`;
+  $('rtcSummary').textContent += ` ${copy.active_prefix}${quality}；${copy.uncertainty_prefix}${uncertainty}；${copy.evidence_prefix}${s.calibration?.evidence_sequence ?? "?"} / ${s.calibration?.evidence_utc_us ?? "?"}；${copy.coefficient_prefix}${coefficient}。${copy.lab_hint}`;
   $('rtcRows').textContent = JSON.stringify(data.rows, null, 2);
 }
 async function rtcHistoryAction(download) {

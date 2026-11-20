@@ -6,7 +6,7 @@
 
 #define RTC_CLOCK_MAGIC UINT32_C(0x52434c31)
 #define RTC_CLOCK_RETENTION_MAGIC UINT32_C(0x52434d31)
-#define RTC_CLOCK_VERSION UINT32_C(3)
+#define RTC_CLOCK_VERSION UINT32_C(4)
 #define RTC_CLOCK_MODEL_VERSION UINT32_C(1)
 #define RTC_CLOCK_SAVE_INTERVAL_US (UINT64_C(86400) * 1000000)
 #define RTC_CLOCK_COOLDOWN_WAKE_US (UINT64_C(120) * 1000000)
@@ -56,6 +56,7 @@ typedef struct {
     rtc_drift_learning_t learning;
     int32_t active_ppm;
     uint32_t active_qualified;
+    rtc_clock_calibration_t calibration;
     uint64_t coefficient_budget_us;
     uint32_t learning_reason;
     uint32_t reference_status;
