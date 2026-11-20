@@ -34,7 +34,8 @@ typedef struct { const char *query; } httpd_req_t;
 #define portEXIT_CRITICAL(p) ((void)(p), --locks)
 #define pdMS_TO_TICKS(ms) (ms)
 static int locks, s_snapshot_lock, code, calls, mode;
-static bool in_owner;
+static bool in_owner, real_pages;
+static rtc_history_t history;
 static void lifecycle_during_owner(void);
 static struct { bool unlocked; struct { uint32_t learning_reason; } clock; } s_snapshot = {true,{13}};
 static char s_session[33] = "0123456789ABCDEF0123456789ABCDEF";
@@ -55,10 +56,11 @@ static void vTaskDelay(int ms) { (void)ms;assert(!locks);if(mode==1)return;if(mo
 rtc_clock_history_summary_t rtc_clock_history_owner_summary(void) {
  assert(in_owner && !locks);calls++;
  if(mode==5)lifecycle_during_owner();
- rtc_clock_history_summary_t s={0};s.ready=mode!=4;s.generation=UINT64_MAX;s.accepted_sequence=UINT64_MAX;s.durable_sequence=UINT64_MAX-1;s.dropped=UINT64_MAX;s.save_budget_us=UINT64_MAX;s.pending_count=UINT32_MAX;s.durable_count=UINT32_MAX;s.flags=UINT32_MAX;s.store_status=INT32_MAX;s.save_result=INT32_MAX;s.legacy_candidate_ppm=INT32_MIN;s.active_ppm=-870;s.active_qualified=true;s.shadow.ppm=INFINITY;s.shadow.result=RTC_HISTORY_ESTIMATE_READY;s.shadow.version=UINT32_MAX;s.shadow.source=UINT32_MAX;s.shadow.samples=UINT32_MAX;s.shadow.inliers=UINT32_MAX;s.shadow.excluded=UINT32_MAX;s.shadow.uncertainty_ppm=1.7976931348623157e308;s.shadow.holdout_baseline_error_us=-1.7976931348623157e308;s.shadow.holdout_candidate_error_us=1.7976931348623157e308;return s;
+ if(real_pages)return (rtc_clock_history_summary_t){.ready=true,.generation=history.generation,.durable_count=history.count};
+ rtc_clock_history_summary_t s={0};s.ready=mode!=4 && mode!=6;s.generation=UINT64_MAX;s.accepted_sequence=UINT64_MAX;s.durable_sequence=UINT64_MAX-1;s.dropped=UINT64_MAX;s.save_budget_us=UINT64_MAX;s.pending_count=UINT32_MAX;s.durable_count=UINT32_MAX;s.flags=UINT32_MAX;s.store_status=mode==4?RTC_HISTORY_STORE_IO_ERROR:mode==6?RTC_HISTORY_STORE_BLOCKED:INT32_MAX;s.save_result=INT32_MAX;s.legacy_candidate_ppm=INT32_MIN;s.active_ppm=-870;s.active_qualified=true;s.shadow.ppm=INFINITY;s.shadow.result=RTC_HISTORY_ESTIMATE_READY;s.shadow.version=UINT32_MAX;s.shadow.source=UINT32_MAX;s.shadow.samples=UINT32_MAX;s.shadow.inliers=UINT32_MAX;s.shadow.excluded=UINT32_MAX;s.shadow.uncertainty_ppm=1.7976931348623157e308;s.shadow.holdout_baseline_error_us=-1.7976931348623157e308;s.shadow.holdout_candidate_error_us=1.7976931348623157e308;return s;
 }
 bool rtc_clock_history_owner_page(uint64_t generation,size_t cursor,rtc_history_page_t *p) {
- assert(in_owner && !locks);assert(generation==UINT64_MAX);memset(p,0,sizeof *p);p->generation=generation;p->total=100;p->cursor=cursor;p->count=cursor<100?5:0;
+ assert(in_owner && !locks);if(real_pages)return rtc_history_page(&history,generation,cursor,p);assert(generation==UINT64_MAX);memset(p,0,sizeof *p);p->generation=generation;p->total=100;p->count=cursor<100?5:0;p->cursor=cursor+p->count;
  for(size_t i=0;i<p->count;i++){p->rows[i]=(rtc_history_record_t){.sequence=UINT64_MAX,.epoch=123456789,.source=2,.utc_end_us=UINT64_MAX,.raw={UINT64_MAX,UINT32_MAX},.awake_delta_us=UINT64_MAX,.utc_delta_us=UINT64_MAX,.combined_uncertainty_us=UINT64_MAX,.flags=UINT16_MAX,.temperature_centi_c=INT16_MIN,.battery_mv=UINT16_MAX,.temp_age_s=UINT16_MAX,.battery_age_s=UINT16_MAX};}return true;
 }
 '''
@@ -75,15 +77,34 @@ int main(void) {
  const char *bad[]={"cursor=1","cursor=-1","cursor=101","cursor=1.0","cursor=18446744073709551616","generation=18446744073709551616","generation=","cursor=","x=1","cursor=0&cursor=0","generation=1&generation=1","cursor=0&","cursor=%30","cursor=0&&generation=1"};
  for(size_t i=0;i<sizeof bad/sizeof bad[0];i++)dispatch(bad[i],400);
  char huge[100];memset(huge,'1',sizeof huge-1);huge[sizeof huge-1]=0;dispatch(huge,400);
- dispatch("generation=1",409);mode=4;dispatch("",503);mode=3;dispatch("",423);
+ dispatch("generation=1",409);mode=4;dispatch("",503);assert(strstr(output,"RTC_HISTORY_IO_ERROR"));mode=6;dispatch("",503);assert(strstr(output,"RTC_HISTORY_BLOCKED"));mode=3;dispatch("",423);
  mode=1;dispatch("",504);mode=0;dispatch("",200);puts(output);
  dispatch("cursor=95&generation=18446744073709551615",200);assert(strstr(output,"\"cursor\":95"));
  dispatch("cursor=100&generation=18446744073709551615",200);assert(strstr(output,"\"rows\":[]"));
  mode=2;dispatch("",503);mode=0;dispatch("",503);history_mailbox_reset(true);dispatch("",200);
  s_history_mailbox.pending=true;dispatch("",503);history_mailbox_reset(true);
  mode=5;dispatch("",503);assert(s_history_mailbox.pending && !s_history_mailbox.complete);
- mode=0;in_owner=true;auth_wifi_history_service(true);in_owner=false;assert(s_history_mailbox.complete && s_history_mailbox.page.cursor==95);
+ mode=0;in_owner=true;auth_wifi_history_service(true);in_owner=false;assert(s_history_mailbox.complete && s_history_mailbox.page.cursor==100);
  history_mailbox_reset(true);int before=calls;auth_wifi_history_service(false);assert(calls==before);
+ real_pages=true;
+ const unsigned totals[]={0,1,3,5,6,100};
+ for(unsigned t=0;t<sizeof totals/sizeof totals[0];++t){
+  rtc_history_init(&history);
+  for(unsigned i=0;i<totals[t];++i){
+   rtc_history_record_t row={.source=2,.sequence=i+1,.epoch=1,.utc_end_us=RTC_HISTORY_UTC_MIN_US+(i+1)*UINT64_C(43200000000),.raw={UINT64_C(43200000000),0},.utc_delta_us=UINT64_C(43200000000)};
+   assert(rtc_history_append(&history,&row));
+  }
+  size_t cursor=0;
+  do {
+   char query[80],expected[80];
+   snprintf(query,sizeof query,"cursor=%zu&generation=%llu",cursor,(unsigned long long)history.generation);
+   dispatch(query,200);
+   size_t next=cursor+(history.count-cursor<5?history.count-cursor:5);
+   snprintf(expected,sizeof expected,"\"cursor\":%zu,\"total\":%zu,\"next_cursor\":%zu",cursor,history.count,next);
+   assert(strstr(output,expected));
+   cursor=next;
+  }while(cursor<history.count);
+ }
  assert(sizeof s_history_mailbox<=1024);fprintf(stderr,"mailbox=%zu summary=%zu page=%zu\n",sizeof s_history_mailbox,sizeof(rtc_clock_history_summary_t),sizeof(rtc_history_page_t));return 0;
 }
 '''
@@ -91,7 +112,7 @@ int main(void) {
             c = Path(directory) / 'history.c'
             binary = Path(directory) / 'history'
             c.write_text(context + support + main)
-            result = subprocess.run([shutil.which('cc') or 'cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(ROOT / 'main'), str(c), '-o', str(binary)], text=True, capture_output=True)
+            result = subprocess.run([shutil.which('cc') or 'cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-I', str(ROOT / 'main'), str(c), str(ROOT / 'main/rtc_history.c'), str(ROOT / 'main/rtc_drift.c'), '-lm', '-o', str(binary)], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             result = subprocess.run([str(binary)], text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)

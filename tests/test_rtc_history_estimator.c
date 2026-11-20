@@ -289,6 +289,112 @@ static bool source_zero_and_inconsistent_holdout(void)
     return true;
 }
 
+static bool recent_independent_recovery(void)
+{
+    for (int sign = -1; sign <= 1; sign += 2) {
+        rtc_history_t history;
+        rtc_history_init(&history);
+        const int rates[] = {842, 7165, 7989};
+        for (unsigned i = 0; i < 3; ++i) {
+            rtc_history_record_t r = record(i + 1, sign * rates[i], 25 * HOUR_US,
+                (i == 1 ? 33 : 16) * 90000);
+            CHECK(rtc_history_append(&history, &r));
+        }
+        rtc_history_estimate_workspace_t workspace;
+        rtc_history_estimate_t estimate;
+        CHECK(rtc_history_estimate(&history, 2, history.rows[2].utc_end_us,
+            sign * 870, &workspace, &estimate));
+        CHECK(estimate.holdout_present && estimate.holdout_improved);
+        /* The newest record validates the candidate; it must not fit it. */
+        CHECK(fabs(estimate.ppm - sign * 7165) < 0.000001);
+        CHECK(estimate.result == RTC_HISTORY_ESTIMATE_RECOVERY);
+        CHECK(estimate.uncertainty_ppm >= 824 + 33 + 16);
+        CHECK(estimate.holdout_candidate_error_us < estimate.holdout_baseline_error_us / 2);
+        const double promoted = estimate.ppm;
+        CHECK(rtc_history_estimate(&history, 2, history.rows[2].utc_end_us,
+            (int32_t)promoted, &workspace, &estimate));
+        CHECK(!estimate.holdout_improved); /* Repeated reads cannot keep moving the rate. */
+    }
+    return true;
+}
+
+static bool recovery_rejects_unsafe_evidence(void)
+{
+    const int pairs[][2] = {
+        {-800, -8000},       /* One large deviation is insufficient. */
+        {-7100, 7000},       /* Opposite residual directions. */
+        {-19000, -6000},     /* Candidate makes the holdout worse. */
+        {-3000, -8000},      /* Less than 50% improvement. */
+        {-6000, -8000},      /* Nominal 72% improvement fails after the variation margin. */
+        {-1100, -1500}       /* Small improvement buried by rate variation. */
+    };
+    for (size_t p = 0; p < sizeof pairs / sizeof pairs[0]; ++p) {
+        rtc_history_t history;
+        rtc_history_init(&history);
+        for (unsigned i = 0; i < 2; ++i) {
+            rtc_history_record_t r = record(i + 1, pairs[p][i], 25 * HOUR_US, 2000000);
+            CHECK(rtc_history_append(&history, &r));
+        }
+        rtc_history_estimate_workspace_t workspace;
+        rtc_history_estimate_t estimate;
+        CHECK(rtc_history_estimate(&history, 2, history.rows[1].utc_end_us,
+            -870, &workspace, &estimate));
+        CHECK(!estimate.holdout_improved);
+    }
+    return true;
+}
+
+static bool recovery_freshness_and_old_majority(void)
+{
+    rtc_history_t history;
+    rtc_history_init(&history);
+    for (unsigned i = 0; i < 30; ++i) {
+        rtc_history_record_t r = record(i + 1, i < 28 ? -850 : (i == 28 ? -7165 : -7989),
+            25 * HOUR_US, 1000000);
+        CHECK(rtc_history_append(&history, &r));
+    }
+    rtc_history_estimate_workspace_t workspace;
+    rtc_history_estimate_t estimate;
+    const uint64_t now = history.rows[29].utc_end_us;
+    CHECK(rtc_history_estimate(&history, 2, now, -870, &workspace, &estimate));
+    CHECK(estimate.holdout_improved && fabs(estimate.ppm + 7165) < 0.000001);
+    CHECK(rtc_history_estimate(&history, 2, now + 8 * 24 * HOUR_US,
+        -870, &workspace, &estimate));
+    CHECK(!estimate.holdout_improved);
+    CHECK(rtc_history_estimate(&history, 0, now, -870, &workspace, &estimate));
+    CHECK(!estimate.holdout_improved && !estimate.samples);
+    return true;
+}
+
+static bool recovery_cannot_skip_newest_evidence(void)
+{
+    for (unsigned kind = 0; kind < 3; ++kind) {
+        rtc_history_t history;
+        rtc_history_init(&history);
+        rtc_history_record_t first = record(1, -7165, 25 * HOUR_US, 1000000);
+        rtc_history_record_t second = record(2, -7989, 25 * HOUR_US, 1000000);
+        rtc_history_record_t third = record(3, -870, 25 * HOUR_US, 1000000);
+        third.epoch = 2;
+        third.utc_end_us -= 6 * HOUR_US; /* Valid cross-epoch overlap with second. */
+        if (kind == 2) {
+            second = record(2, -870, 25 * HOUR_US, 1000000);
+            second.epoch = 2;
+            second.utc_end_us -= 6 * HOUR_US;
+            third = record(3, -7989, 25 * HOUR_US, 1000000);
+            third.utc_end_us = second.utc_end_us + third.utc_delta_us;
+        }
+        CHECK(rtc_history_append(&history, &first));
+        CHECK(rtc_history_append(&history, &second));
+        CHECK(rtc_history_append(&history, &third));
+        rtc_history_estimate_workspace_t workspace;
+        rtc_history_estimate_t estimate;
+        CHECK(rtc_history_estimate(&history, 2,
+            kind == 1 ? second.utc_end_us : third.utc_end_us, -870, &workspace, &estimate));
+        CHECK(estimate.excluded == 1 && !estimate.holdout_improved);
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     const struct { const char *name; bool (*run)(void); } tests[] = {
@@ -303,7 +409,11 @@ int main(int argc, char **argv)
         {"reference_quality_weights", reference_quality_weights},
         {"fractional_rates_and_exact_limits", fractional_rates_and_exact_limits},
         {"heterogeneous_endpoint_weights", heterogeneous_endpoint_weights},
-        {"source_zero_and_inconsistent_holdout", source_zero_and_inconsistent_holdout}
+        {"source_zero_and_inconsistent_holdout", source_zero_and_inconsistent_holdout},
+        {"recent_independent_recovery", recent_independent_recovery},
+        {"recovery_rejects_unsafe_evidence", recovery_rejects_unsafe_evidence},
+        {"recovery_freshness_and_old_majority", recovery_freshness_and_old_majority},
+        {"recovery_cannot_skip_newest_evidence", recovery_cannot_skip_newest_evidence}
     };
     for (size_t i = 0; i < sizeof tests / sizeof tests[0]; ++i) {
         if (argc == 2 && strcmp(argv[1], tests[i].name) != 0) continue;

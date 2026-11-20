@@ -1484,6 +1484,11 @@ void app_main(void)
              (unsigned)clock_diag.pre_tail_gap_upper_us, (unsigned)clock_diag.fault,
              (unsigned)clock_diag.user_wake, (unsigned)clock_diag.maintenance_blocked,
              (unsigned)clock_diag.model_observations, (unsigned)clock_diag.model_rms_millippm);
+    const rtc_clock_history_summary_t history_diag = rtc_clock_history_owner_summary();
+    ESP_LOGI(TAG, "RTC_HISTORY source=%u ready=%u status=%u rows=%lu pending=%lu ppm=%ld qualified=%u reason=%lu",
+             (unsigned)clock_diag.source, (unsigned)history_diag.ready, (unsigned)history_diag.store_status,
+             (unsigned long)history_diag.durable_count, (unsigned long)history_diag.pending_count,
+             (long)clock_diag.ppm, (unsigned)clock_diag.ppm_qualified, (unsigned long)clock_diag.learning_reason);
     init_power_management();
 
     /* 1. Shared I2C Bus */

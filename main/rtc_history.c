@@ -202,6 +202,62 @@ static bool sample_inlier(const rtc_history_estimate_sample_t *sample,
     return fabs(sample->ppm - median->ppm) <= tolerance;
 }
 
+static void recent_recovery(const rtc_history_t *history, uint64_t now_utc_us,
+    int32_t baseline_ppm, const rtc_history_estimate_sample_t *training,
+    const rtc_history_estimate_sample_t *holdout, rtc_history_estimate_t *estimate)
+{
+    const uint64_t max_age = UINT64_C(7) * 86400 * 1000000;
+    rtc_history_record_t prior, latest;
+    if (estimate->result != RTC_HISTORY_ESTIMATE_INCONSISTENT ||
+        !rtc_history_get(history, training->row_index, &prior) ||
+        !rtc_history_get(history, holdout->row_index, &latest) ||
+        now_utc_us - prior.utc_end_us > max_age ||
+        now_utc_us - latest.utc_end_us > max_age) return;
+    /* Do not fall back to a favorable older pair when a newer same-source
+     * record was excluded (future UTC or a cross-epoch overlapping window). */
+    size_t expected = holdout->row_index;
+    unsigned found = 0;
+    for (size_t i = history->count; i > 0 && found < 2; --i) {
+        const rtc_history_record_t *row = row_at(history, i - 1);
+        if (row->source != latest.source) continue;
+        if (i - 1 != expected) return;
+        expected = training->row_index;
+        ++found;
+    }
+    if (found != 2) return;
+
+    const double previous_error = training->ppm - baseline_ppm;
+    const double latest_error = holdout->ppm - baseline_ppm;
+    /* Both windows must independently exclude the active rate in the same
+     * direction. A single bad reference cannot move the coefficient. */
+    if (previous_error * latest_error <= 0.0 ||
+        fabs(previous_error) <= 1000.0 + training->uncertainty_ppm ||
+        fabs(latest_error) <= 1000.0 + holdout->uncertainty_ppm) return;
+
+    /* Select using only the previous window, then validate on the newest one.
+     * Include observed nonstationarity; never call a variable rate a precise fit. */
+    const double candidate = round(training->ppm);
+    const double uncertainty = fmax(200.0, fabs(holdout->ppm - training->ppm) +
+        training->uncertainty_ppm + holdout->uncertainty_ppm + fabs(candidate - training->ppm));
+    const double bridge = (double)(latest.utc_delta_us - latest.awake_delta_us);
+    const double raw = (double)latest.raw.us + (double)latest.raw.fraction_q19 / RTC_DRIFT_Q19;
+    const double baseline_error = fabs(raw * 1000000.0 / (1000000.0 + baseline_ppm) - bridge);
+    const double candidate_error = fabs(raw * 1000000.0 / (1000000.0 + candidate) - bridge);
+    const double margin = 2.0 * latest.combined_uncertainty_us +
+        uncertainty * bridge / (1000000.0 + candidate);
+    if (baseline_error - candidate_error <= margin ||
+        candidate_error + margin >= baseline_error * 0.5) return;
+
+    estimate->result = RTC_HISTORY_ESTIMATE_RECOVERY;
+    estimate->inliers = 1; /* One training window; the holdout is not fitted. */
+    estimate->ppm = candidate;
+    estimate->uncertainty_ppm = uncertainty;
+    estimate->holdout_present = true;
+    estimate->holdout_improved = true;
+    estimate->holdout_baseline_error_us = baseline_error;
+    estimate->holdout_candidate_error_us = candidate_error;
+}
+
 bool rtc_history_estimate(const rtc_history_t *history, uint32_t source,
     uint64_t now_utc_us, int32_t baseline_ppm, rtc_history_estimate_workspace_t *workspace,
     rtc_history_estimate_t *estimate)
@@ -245,6 +301,9 @@ bool rtc_history_estimate(const rtc_history_t *history, uint32_t source,
         *estimate = value;
         return true;
     }
+    /* Preserve chronological endpoints before the weighted-median sort. */
+    const rtc_history_estimate_sample_t previous = workspace->samples[value.samples - 2];
+    const rtc_history_estimate_sample_t latest = workspace->samples[value.samples - 1];
     value.holdout_present = value.samples >= 3;
     const size_t training = value.samples - (value.holdout_present ? 1 : 0);
     sort_samples(workspace->samples, training);
@@ -302,6 +361,7 @@ bool rtc_history_estimate(const rtc_history_t *history, uint32_t source,
     }
     if (!isfinite(value.ppm) || !isfinite(value.uncertainty_ppm) ||
         value.ppm < -20000.0 || value.ppm > 20000.0) return false;
+    recent_recovery(history, now_utc_us, baseline_ppm, &previous, &latest, &value);
     *estimate = value;
     return true;
 }

@@ -217,7 +217,7 @@ void auth_wifi_history_service(bool unlocked)
         result = !summary.ready ? 503 : has_generation && generation != summary.generation ? 409 : 200;
         if (result == 200 && !rtc_clock_history_owner_page(summary.generation, cursor, &page)) result = 409;
         if (result == 200 && (page.count > RTC_HISTORY_PAGE_SIZE || page.total > RTC_HISTORY_CAPACITY ||
-            page.cursor != cursor || page.cursor > page.total || page.count > page.total - page.cursor ||
+            cursor > page.total || page.count > page.total - cursor || page.cursor != cursor + page.count ||
             page.generation != summary.generation)) result = 503;
         portENTER_CRITICAL(&s_snapshot_lock);
         reason = s_snapshot.clock.learning_reason;
@@ -291,7 +291,7 @@ static esp_err_t history_send(httpd_req_t *req, const rtc_clock_history_summary_
         "\"ready\":%s,\"accepted_sequence\":\"%llu\",\"durable_sequence\":\"%llu\",\"dropped\":\"%llu\",\"save_budget_us\":\"%llu\","
         "\"durable_count\":%lu,\"pending_count\":%lu,\"flags\":%lu,\"store_status\":%u,\"save_result\":%u,"
         "\"active_ppm\":%ld,\"active_qualified\":%s,\"legacy_candidate_ppm\":%ld,\"legacy_candidate_qualified\":%s,\"learning_reason\":%lu,",
-        (unsigned long long)s->generation, (unsigned)page->cursor, (unsigned)page->total, (unsigned)(page->cursor + page->count),
+        (unsigned long long)s->generation, (unsigned)(page->cursor - page->count), (unsigned)page->total, (unsigned)page->cursor,
         s->ready ? "true" : "false", (unsigned long long)s->accepted_sequence, (unsigned long long)s->durable_sequence,
         (unsigned long long)s->dropped, (unsigned long long)s->save_budget_us, (unsigned long)s->durable_count,
         (unsigned long)s->pending_count, (unsigned long)s->flags, (unsigned)s->store_status, (unsigned)s->save_result,
@@ -357,15 +357,17 @@ static esp_err_t history_handler(httpd_req_t *req)
     s_history_mailbox.complete = false;
     s_history_mailbox.processing = false;
     portEXIT_CRITICAL(&s_history_lock);
-    rtc_clock_history_summary_t summary;
-    rtc_history_page_t page;
+    rtc_clock_history_summary_t summary = {0};
+    rtc_history_page_t page = {0};
     uint32_t reason = 0;
+    bool have_summary = false;
     unsigned result = 504;
     for (unsigned attempt = 0; attempt < 100; ++attempt) {
         portENTER_CRITICAL(&s_history_lock);
         bool cancelled = !s_history_mailbox.enabled || s_history_mailbox.id != id;
         bool complete = !cancelled && s_history_mailbox.complete;
         if (complete) {
+            have_summary = true;
             summary = s_history_mailbox.summary;
             page = s_history_mailbox.page;
             result = s_history_mailbox.result;
@@ -388,6 +390,12 @@ static esp_err_t history_handler(httpd_req_t *req)
     if (!unlocked || result == 423) return error_response(req, "423 Locked", "Unlock the device first");
     if (result == 409) return error_response(req, "409 Conflict", "History generation changed; refresh");
     if (result == 504) return error_response(req, "504 Gateway Timeout", "History owner timed out");
+    if (result == 503 && have_summary && !summary.ready) {
+        const char *error = summary.store_status == RTC_HISTORY_STORE_IO_ERROR ?
+            "RTC_HISTORY_IO_ERROR" : summary.store_status == RTC_HISTORY_STORE_BLOCKED ?
+            "RTC_HISTORY_BLOCKED" : "RTC_HISTORY_NOT_READY";
+        return error_response(req, "503 Service Unavailable", error);
+    }
     if (result != 200) return error_response(req, "503 Service Unavailable", "History not ready or cancelled");
     return history_send(req, &summary, &page, reason);
 }

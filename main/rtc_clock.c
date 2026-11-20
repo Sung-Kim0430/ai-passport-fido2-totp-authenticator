@@ -28,6 +28,7 @@ static struct {
     bool history_started;
     bool history_retained_valid;
     bool history_busy;
+    int64_t history_retry_us;
     rtc_history_store_result_t history_status;
     rtc_history_store_result_t history_save_result;
     rtc_history_estimate_t history_shadow;
@@ -203,12 +204,17 @@ static void history_refresh(void)
     }
     s_clock.history_shadow = estimate;
     rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
-    if (s_clock.boot_done && s_clock.supported && rtc_clock_platform_source() == s_clock.source &&
-        estimate.result == RTC_HISTORY_ESTIMATE_READY && estimate.inliers >= 2 && isfinite(estimate.ppm)) {
+    const bool stable = estimate.result == RTC_HISTORY_ESTIMATE_READY && estimate.inliers >= 2;
+    const bool recovery = estimate.result == RTC_HISTORY_ESTIMATE_RECOVERY &&
+        a->active_qualified && estimate.holdout_present && estimate.holdout_improved;
+    if (s_clock.boot_done && s_clock.supported && !rtc_clock_retained.history.count &&
+        rtc_clock_retained.history.accepted_sequence == rtc_clock_retained.history.durable_sequence &&
+        rtc_clock_platform_source() == s_clock.source &&
+        (stable || recovery) && isfinite(estimate.ppm)) {
         const long long rounded = llround(estimate.ppm);
         if (rounded >= -20000 && rounded <= 20000) {
             const int32_t candidate = (int32_t)rounded;
-            const bool initial = !a->active_qualified && estimate.uncertainty_ppm <= 100.0;
+            const bool initial = stable && !a->active_qualified && estimate.uncertainty_ppm <= 100.0;
             const bool refine = a->active_qualified && estimate.holdout_improved && candidate != a->active_ppm;
             if (initial || refine) {
                 a->active_ppm = candidate;
@@ -224,6 +230,8 @@ static void history_refresh(void)
 static void history_open(void)
 {
     rtc_history_store_t *store = &s_clock.history->store;
+    const int64_t now = rtc_clock_platform_uptime_us();
+    s_clock.history_retry_us = now > INT64_MAX - INT64_C(60000000) ? INT64_MAX : now + INT64_C(60000000);
     s_clock.history_busy = true;
     rtc_history_store_io_t io = store->io;
     if (!io.read || !io.write || !io.commit) {
@@ -756,6 +764,9 @@ void rtc_clock_tick(void)
     history_start();
     advance_budget(rtc_clock_platform_uptime_us());
     history_checkpoint();
+    if (s_clock.history && !s_clock.history_busy &&
+        s_clock.history_status == RTC_HISTORY_STORE_IO_ERROR &&
+        rtc_clock_platform_uptime_us() >= s_clock.history_retry_us) history_open();
     const int64_t now = rtc_clock_platform_uptime_us();
     if (now >= s_clock.next_sample_us) {
         s_clock.next_sample_us = now + 60000000;
@@ -1028,6 +1039,7 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
     rtc_clock_accounting_t next = rtc_clock_retained.accounting;
     rtc_history_record_t history_row;
     bool capture_history = false;
+    bool evidence_dropped = false;
     uint64_t reference_awake = 0;
     const bool eligible = s_clock.boot_done && reference->quality && age <= UINT64_C(5000000) && s_clock.supported &&
         awake_at(reference->hrt_us, &reference_awake) && rtc_clock_platform_source() == s_clock.source;
@@ -1043,6 +1055,7 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
             next.learning_reason == RTC_DRIFT_LEARN_INCONSISTENT) {
             capture_history = history_window(&history_row, &rtc_clock_retained.accounting.learning.baseline, &sample);
             if (capture_history && rtc_clock_retained.history.count == 2) {
+                evidence_dropped = true;
                 const rtc_drift_learning_t advanced = next.learning;
                 next.learning = rtc_clock_retained.accounting.learning;
                 next.learning.baseline = advanced.baseline;
@@ -1061,7 +1074,10 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
     const int64_t after = rtc_clock_platform_uptime_us();
     const bool checked = after >= before && after - before <= CLOCK_CAPTURE_MAX_US;
     if (checked) {
-        if (eligible && !next.active_qualified && next.learning.qualified) {
+        const bool unavailable = s_clock.history_status == RTC_HISTORY_STORE_IO_ERROR;
+        const bool fallback = unavailable && !evidence_dropped && capture_history &&
+            next.learning_reason == RTC_DRIFT_LEARN_PUBLISHED;
+        if (eligible && next.learning.qualified && (!next.active_qualified || fallback)) {
             next.active_ppm = next.learning.ppm;
             next.active_qualified = 1;
         }
