@@ -634,12 +634,13 @@ static void check_learning_and_coefficient_budget(void) {
     assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
     assert(rtc_clock_maintenance_due(true) && coefficient_saves == 0);
     const unsigned old_reads = reads, old_saves = saves, old_measures = measures;
+    fail_coefficient_save = true;
     assert(rtc_clock_prepare_maintenance());
     rtc_clock_tick();
     assert(rtc_clock_commit_sleep(true));
     assert(armed_interval_us == RTC_CLOCK_STEADY_WAKE_US);
     assert(reads == old_reads && saves == old_saves && measures == old_measures + 1);
-    assert(coefficient_saves == 0);
+    assert(coefficient_saves == 1 && stored_ppm == 0);
     assert(rtc_clock_abort_sleep());
     fail_coefficient_save = true;
     rtc_clock_tick();
@@ -1562,6 +1563,7 @@ static void check_recent_history_activation_and_provenance(void) {
         assert(rtc_clock_history_owner_summary().active_ppm == -7990);
         assert(!memcmp(&accepted, &rtc_clock_retained.accounting.calibration, sizeof accepted));
         reboot_runtime();
+        memset(&rtc_clock_retained, 0, sizeof rtc_clock_retained); /* Complete retention loss. */
         initialize_runtime(false, true);
         view = rtc_clock_history_owner_summary();
         assert(view.active_ppm == -7990 && view.coefficient_saved);
@@ -1688,7 +1690,74 @@ static void check_sub10ppm_save_and_30day_convergence(void) {
     assert(err_us >= -5000000 && err_us <= 5000000);
 }
 
+/* USB/software resets must not discard a verified rate or its write budget.
+ * UTC and exposure continuity still require a real deep-sleep continuation. */
+static void check_maintenance_reason_survives_sync_and_restart(void) {
+    reset_all(); rtc_clock_boot(false, false);
+    rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_ATTEMPT);
+    rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_REJECT);
+    assert(rtc_clock_diagnostics().maintenance_attempts == 1);
+    assert(rtc_clock_diagnostics().maintenance_failures == 1);
+    rtc_clock_reference_t ref = reference_now(1, (uint64_t)wall_us);
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+    assert(rtc_clock_diagnostics().last_maintenance_reason == RTC_CLOCK_MAINTENANCE_REJECT);
+    rtc_clock_wall_time_set();
+    reboot_runtime();
+    assert(rtc_clock_boot(false, false) == RTC_CLOCK_BASELINE);
+    assert(rtc_clock_diagnostics().maintenance_failures == 1);
+    assert(rtc_clock_diagnostics().last_maintenance_reason == RTC_CLOCK_MAINTENANCE_REJECT);
+    rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_ATTEMPT);
+    rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_KEY);
+    assert(rtc_clock_diagnostics().maintenance_attempts == 2);
+    assert(rtc_clock_diagnostics().maintenance_failures == 1);
+}
+
+static void check_restart_keeps_rate_and_budget_without_utc(void) {
+    reset_all();
+    coefficient_store = RTC_CLOCK_STORE_VALID; stored_ppm = -870;
+    assert(rtc_clock_boot(false, false) == RTC_CLOCK_BASELINE);
+    rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
+    a->active_ppm = -7165; a->active_qualified = 1;
+    a->calibration.quality = RTC_CLOCK_CALIBRATION_LEGACY;
+    a->coefficient_budget_us = UINT64_C(9) * 3600 * 1000000;
+    rtc_drift_learning_reset(&a->learning, source, a->continuity, -7165, true);
+    a->checksum = rtc_clock_checksum(a, offsetof(rtc_clock_accounting_t, checksum));
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    const uint64_t budget = a->coefficient_budget_us;
+    reboot_runtime(); uptime_us = 1000;
+    assert(rtc_clock_boot(false, false) == RTC_CLOCK_BASELINE);
+    assert(rtc_clock_diagnostics().ppm == -7165);
+    assert(rtc_clock_retained.accounting.coefficient_budget_us == budget);
+    assert(!rtc_clock_retained.session.magic && !rtc_clock_diagnostics().utc_restored);
+    assert(!rtc_clock_retained.accounting.raw_total.us && !rtc_clock_retained.accounting.awake_total_us);
+    assert(!rtc_clock_retained.accounting.learning.baseline_valid && !coefficient_saves);
+    rtc_clock_retained.accounting.checksum ^= 1;
+    reboot_runtime();
+    assert(rtc_clock_boot(false, false) == RTC_CLOCK_BASELINE);
+    assert(rtc_clock_diagnostics().ppm == -870);
+    assert(!rtc_clock_retained.accounting.coefficient_budget_us);
+}
+static void check_maintenance_saves_due_coefficient(void) {
+    reset_all(); prepare_session(); rtc_clock_abort_sleep();
+    rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
+    a->active_ppm = -7165; a->active_qualified = 1;
+    a->calibration.quality = RTC_CLOCK_CALIBRATION_LEGACY;
+    a->coefficient_budget_us = RTC_CLOCK_SAVE_INTERVAL_US;
+    rtc_drift_learning_reset(&a->learning, source, a->continuity, -7165, true);
+    a->checksum = rtc_clock_checksum(a, offsetof(rtc_clock_accounting_t, checksum));
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    ticks += 40000000; uptime_us = 3000; reboot_runtime();
+    assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+    assert(rtc_clock_prepare_maintenance());
+    assert(coefficient_saves == 1 && stored_ppm == -7165);
+    assert(rtc_clock_commit_sleep(true));
+    assert(coefficient_saves == 1);
+}
+
 int main(int argc, char **argv) {
+    check_maintenance_reason_survives_sync_and_restart();
+    check_restart_keeps_rate_and_budget_without_utc();
+    check_maintenance_saves_due_coefficient();
     if (argc == 2) {
         if (!strcmp(argv[1], "init")) check_history_init_recovery();
         else if (!strcmp(argv[1], "populated")) check_history_populated_init_recovery();

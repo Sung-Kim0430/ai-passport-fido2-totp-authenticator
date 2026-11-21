@@ -189,25 +189,29 @@ error. Windows require at least six hours of raw bridge exposure, at most
 Insufficient evidence leaves correction unchanged; the software rejection range
 is ±20000 ppm, not a hardware tolerance or promised accuracy.
 
-Qualified significant coefficient changes are saved separately, never inside a
-sync operation or maintenance boot. All coefficient saves, including a missing
-record's first save, wait for a 24-hour internal budget from cold boot or the
-last attempt; failures consume the allowance. Cold boot resets the wait and
-unsaved learning evidence. Corrupt/unsupported records are not overwritten.
+The RTC calibration retention area now uses `RTC_NOINIT` with layout versioning. When the magic
+number, version, source, semantic checks, and CRC all pass, software or USB resets preserve
+qualified active coefficients, their source, accumulated write budgets, and maintenance diagnostics;
+UTC, learning baselines, and elapsed time continuity are not restored, meaning time
+resynchronization is still required. If the retention area is invalid or after complete power loss,
+ppm is loaded from NVS as LEGACY and the budget is re-accumulated. The 24-hour coefficient write
+budget remains unchanged, and background maintenance now also executes due coefficient saves, with
+failed writes consuming budget. When scheduled maintenance fails while the button watcher is normal
+and no buttons are pressed, the device keeps the screen off, disables timed retries, revokes time-trusted status, and enters button-only-wake deep sleep; faults in buttons, the watcher, or GPIO
+configurations still allow normal startup. Maintenance attempt counts, failure counts, and the last
+maintenance outcome are exposed via `/api/status` and preserved across time syncs. Note that
+overnight accuracy improvements have not yet been demonstrated on physical hardware.
+
 Temperature-model learning still uses 12 fixed observations, three bins, 3 °C
 span and fit RMS ≤100 ppm, but never supplies another UTC rate correction.
 Its separate model-save policy remains distinct. Sampling uses the existing
 application task outside LVGL locks; the sensor is fully uninstalled before sleep.
 
-While sleeping with trusted continuation, a **900-second normal SDK timer wake**
-restores one segment, refreshes the direct measurement and re-enters sleep before
-BSP/display/audio/radio initialization. It does not sample temperature, commit
-NVS or create a permanent task. Only a pure timer wake may use this route;
-mixed causes, setup failures, invalid state, observed key evidence and rejected
-sleep enter full startup. GPIO0's early digital observer latches falling edges,
+Trusted sleep retains the **120-second initial cooldown / 900-second steady**
+maintenance cadence. GPIO0's early digital observer latches falling edges,
 pending status and held-low evidence; the existing guard discards the entire
 wake gesture before normal input. The old calibration/re-sleep wake stub remains
-**off** (`CONFIG_AUTH_RTC_WAKE_STUB`) and is not used by this route.
+**off** (`CONFIG_AUTH_RTC_WAKE_STUB`).
 
 Pre-observer ROM/SDK startup and the final SDK/CRC tail still have unproven
 short-pulse coverage. Minimum physical key pulses, repeated wake/re-sleep,

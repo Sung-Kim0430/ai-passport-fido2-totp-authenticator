@@ -379,6 +379,8 @@ static bool accounting_valid(void)
     if (a->checksum != rtc_clock_checksum(a, offsetof(rtc_clock_accounting_t, checksum))) return false;
     const rtc_clock_calibration_t *calibration = &a->calibration;
     if (calibration->quality > RTC_CLOCK_CALIBRATION_RECOVERY || calibration->uncertainty_valid > 1 ||
+        a->last_maintenance_reason > RTC_CLOCK_MAINTENANCE_REJECT ||
+        a->maintenance_failures > a->maintenance_attempts ||
         (!calibration->uncertainty_valid && calibration->uncertainty_millippm) ||
         (a->active_qualified != (calibration->quality != RTC_CLOCK_CALIBRATION_NONE)) ||
         ((calibration->evidence_sequence == 0) != (calibration->evidence_utc_us == 0)) ||
@@ -418,8 +420,8 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
     s_clock.source = rtc_clock_platform_source();
     s_clock.supported = rtc_clock_platform_supported() && (s_clock.source == 0 || s_clock.source == 2);
     s_clock.restore_authorized = time_trusted;
-    s_clock.continuity_valid = deep_wakeup && rtc_clock_retained.magic == RTC_CLOCK_RETENTION_MAGIC &&
-        accounting_valid();
+    const bool retained_valid = rtc_clock_retained.magic == RTC_CLOCK_RETENTION_MAGIC && accounting_valid();
+    s_clock.continuity_valid = deep_wakeup && retained_valid;
     s_clock.history_retained_valid = s_clock.continuity_valid && history_retained_valid();
     int32_t ppm = 0;
     const rtc_clock_store_result_t coefficient = rtc_clock_platform_load_coefficient(&ppm);
@@ -428,6 +430,7 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
         (coefficient == RTC_CLOCK_STORE_VALID && !s_clock.coefficient_saved);
     s_clock.saved_ppm = s_clock.coefficient_saved ? ppm : 0;
     if (!s_clock.continuity_valid) {
+        const rtc_clock_accounting_t previous = rtc_clock_retained.accounting;
         memset(&rtc_clock_retained.accounting, 0, sizeof rtc_clock_retained.accounting);
         rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
         a->version = RTC_CLOCK_VERSION;
@@ -436,8 +439,21 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
         a->active_ppm = s_clock.saved_ppm;
         a->active_qualified = s_clock.coefficient_saved;
         a->calibration.quality = s_clock.coefficient_saved ? RTC_CLOCK_CALIBRATION_LEGACY : RTC_CLOCK_CALIBRATION_NONE;
+        if (retained_valid) {
+            /* Recover only rate/provenance/budget. A reset never restores UTC,
+             * learning baselines, fractional phase or elapsed-time continuity. */
+            if (previous.active_qualified) {
+                a->active_ppm = previous.active_ppm;
+                a->active_qualified = 1;
+                a->calibration = previous.calibration;
+            }
+            a->coefficient_budget_us = previous.coefficient_budget_us;
+            a->maintenance_attempts = previous.maintenance_attempts;
+            a->maintenance_failures = previous.maintenance_failures;
+            a->last_maintenance_reason = previous.last_maintenance_reason;
+        }
         rtc_drift_learning_reset(&a->learning, a->source, a->continuity,
-            s_clock.saved_ppm, s_clock.coefficient_saved);
+            a->active_ppm, a->active_qualified);
         seal_accounting();
     }
     s_clock.execution_hrt_us = s_clock.budget_hrt_us = rtc_clock_platform_uptime_us();
@@ -911,6 +927,9 @@ bool rtc_clock_prepare_maintenance(void)
     if (!rtc_clock_maintenance_due(true)) return false;
     s_clock.prepared_period = 0;
     s_clock.maintenance = true;
+    /* Use the existing 24h budget even when there is no normal user wake.
+     * Complete Flash work before measuring the period used for the next sleep. */
+    checkpoint_coefficient();
     const uint32_t period = rtc_clock_platform_measure();
     const bool source_changed = rtc_clock_platform_source() != s_clock.source;
     if (!rtc_drift_period_valid(period) || source_changed) {
@@ -923,6 +942,19 @@ bool rtc_clock_prepare_maintenance(void)
     }
     s_clock.prepared_period = period;
     return true;
+}
+
+void rtc_clock_note_maintenance(rtc_clock_maintenance_reason_t reason)
+{
+    if (!s_clock.initialized || (unsigned)reason > RTC_CLOCK_MAINTENANCE_REJECT) return;
+    rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
+    if (reason == RTC_CLOCK_MAINTENANCE_ATTEMPT && a->maintenance_attempts != UINT32_MAX)
+        ++a->maintenance_attempts;
+    if (reason != RTC_CLOCK_MAINTENANCE_NONE && reason != RTC_CLOCK_MAINTENANCE_ATTEMPT &&
+        reason != RTC_CLOCK_MAINTENANCE_KEY && a->maintenance_failures < a->maintenance_attempts)
+        ++a->maintenance_failures;
+    a->last_maintenance_reason = reason;
+    seal_accounting();
 }
 
 void rtc_clock_begin_normal_wake(void)
@@ -982,6 +1014,9 @@ rtc_clock_diagnostics_t rtc_clock_diagnostics(void)
         .corrected_chain_us = a->corrected_total.us,
         .awake_total_us = awake,
         .maintenance_count = a->maintenance_count,
+        .maintenance_attempts = a->maintenance_attempts,
+        .maintenance_failures = a->maintenance_failures,
+        .last_maintenance_reason = a->last_maintenance_reason,
         .learning_reason = a->learning_reason,
         .reference_status = (rtc_clock_reference_result_t)a->reference_status
     };

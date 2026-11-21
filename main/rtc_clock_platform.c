@@ -18,7 +18,9 @@
 #include "sdkconfig.h"
 #include "soc/rtc.h"
 
-RTC_DATA_ATTR rtc_clock_retained_t rtc_clock_retained;
+/* Keep qualified calibration and write budget over USB/software resets.
+ * Every consumer validates version/source/CRC; UTC still requires deep sleep. */
+RTC_NOINIT_ATTR rtc_clock_retained_t rtc_clock_retained;
 static temperature_sensor_handle_t s_sensor;
 static bool s_sensor_enabled;
 static const char *TAG = "rtc_clock";

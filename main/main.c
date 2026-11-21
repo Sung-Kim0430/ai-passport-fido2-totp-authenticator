@@ -225,15 +225,49 @@ static bool clock_key_observer_begin(void)
 
 static void clock_maintenance_try(bool timer_only, bool observer_ready)
 {
-    if (!observer_ready || !rtc_clock_maintenance_due(timer_only) || clock_key_pending()) return;
-    if (!rtc_clock_prepare_maintenance() || clock_key_pending()) goto canceled;
+    if (!timer_only) return;
+    rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_ATTEMPT);
+    if (clock_key_pending()) {
+        rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_KEY);
+        return;
+    }
+    if (!observer_ready) {
+        rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_OBSERVER);
+        return;
+    }
+    if (!rtc_clock_maintenance_due(true)) {
+        rtc_clock_note_maintenance(RTC_CLOCK_MAINTENANCE_NOT_DUE);
+        return;
+    }
+    rtc_clock_maintenance_reason_t reason = RTC_CLOCK_MAINTENANCE_PREPARE;
+    if (!rtc_clock_prepare_maintenance()) goto canceled;
+    if (clock_key_pending()) { reason = RTC_CLOCK_MAINTENANCE_KEY; goto canceled; }
+    reason = RTC_CLOCK_MAINTENANCE_GPIO;
     if (esp_deep_sleep_enable_gpio_wakeup(1ULL << BSP_BTN_GPIO, ESP_GPIO_WAKEUP_GPIO_LOW) != ESP_OK)
         goto canceled;
-    if (!rtc_clock_commit_sleep(auth_time_is_set()) || clock_key_pending()) goto canceled;
+    reason = RTC_CLOCK_MAINTENANCE_COMMIT;
+    if (!rtc_clock_commit_sleep(auth_time_is_set())) goto canceled;
+    if (clock_key_pending()) { reason = RTC_CLOCK_MAINTENANCE_KEY; goto canceled; }
+    reason = RTC_CLOCK_MAINTENANCE_REJECT;
     (void)esp_deep_sleep_try_to_start();
 
 canceled:
     (void)rtc_clock_abort_sleep();
+    rtc_clock_note_maintenance(reason);
+}
+
+/* A failed unattended maintenance must not initialize the screen/radios.
+ * Keep a real key observable, stop timer retries, and explicitly revoke UTC
+ * trust rather than continuing to display a possibly incorrect time. */
+static void clock_maintenance_quiet_fallback(bool timer_only, bool observer_ready)
+{
+    if (!timer_only || !observer_ready || clock_key_pending()) return;
+    (void)rtc_clock_abort_sleep();
+    auth_time_init(false);
+    if (esp_deep_sleep_enable_gpio_wakeup(1ULL << BSP_BTN_GPIO, ESP_GPIO_WAKEUP_GPIO_LOW) != ESP_OK)
+        return;
+    if (clock_key_pending()) return;
+    esp_deep_sleep_start();
 }
 
 static void system_enter_deep_sleep(void)
@@ -1440,8 +1474,8 @@ void app_main(void)
     key_guard_arm(&s_key_guard);
     const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
     const bool timer_only = clock_deep_wakeup && wake_causes == (1U << ESP_SLEEP_WAKEUP_TIMER);
-    const bool observer_ready = timer_only && clock_key_observer_begin();
     bsp_display_backlight_early_off();
+    const bool observer_ready = timer_only && clock_key_observer_begin();
     esp_deep_sleep_disable_rom_logging();
 
     /* 0. NVS Flash initialization */
@@ -1463,6 +1497,7 @@ void app_main(void)
         bsp_display_hold_sleep_levels();
     }
     clock_maintenance_try(timer_only, observer_ready);
+    clock_maintenance_quiet_fallback(timer_only, observer_ready);
     clock_key_observer_end();
     rtc_clock_begin_normal_wake();
 

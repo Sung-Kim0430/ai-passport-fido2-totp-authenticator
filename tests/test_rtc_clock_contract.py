@@ -119,6 +119,10 @@ int main(void) {
         self.assertNotIn("rtc_clock_tick", keepalive)
         self.assertLess(app.index("rtc_clock_tick()"), app.index("ui_lock()"))
 
+    def test_calibration_retention_is_not_reinitialized_on_software_reset(self):
+        source = (ROOT / "main/rtc_clock_platform.c").read_text()
+        self.assertIn("RTC_NOINIT_ATTR rtc_clock_retained_t rtc_clock_retained;", source)
+
     def test_disabled_maintenance_restores_default_stub(self):
         body = function_body((ROOT / "main/rtc_clock_platform.c").read_text(), "rtc_clock_platform_arm")
         self.assertIn("esp_set_deep_sleep_wake_stub(esp_wake_deep_sleep)", body)
@@ -159,6 +163,12 @@ int main(void) {
 #include <setjmp.h>
 enum { BSP_BTN_GPIO = 0, ESP_GPIO_WAKEUP_GPIO_LOW = 0, ESP_OK = 0 };
 static bool due, key_seen, prepared, committed, trusted, complete_sleep, key_during_prepare, key_during_commit;
+enum { RTC_CLOCK_MAINTENANCE_NONE, RTC_CLOCK_MAINTENANCE_ATTEMPT,
+ RTC_CLOCK_MAINTENANCE_OBSERVER, RTC_CLOCK_MAINTENANCE_NOT_DUE,
+ RTC_CLOCK_MAINTENANCE_KEY, RTC_CLOCK_MAINTENANCE_PREPARE,
+ RTC_CLOCK_MAINTENANCE_GPIO, RTC_CLOCK_MAINTENANCE_COMMIT, RTC_CLOCK_MAINTENANCE_REJECT };
+typedef int rtc_clock_maintenance_reason_t;
+static void rtc_clock_note_maintenance(int reason) { (void)reason; }
 static int gpio_error, prepares, commits, sleeps, aborts;
 static jmp_buf slept;
 static bool rtc_clock_maintenance_due(bool timer_only) { return timer_only && due; }
@@ -275,6 +285,50 @@ int main(void) {
             test.write_text(source)
             subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", str(test), "-o", str(output)], check=True)
             subprocess.run([str(output)], check=True)
+
+    def test_timer_failure_has_quiet_fallback_before_display_init(self):
+        source = (ROOT / "main/main.c").read_text()
+        boot = function_body(source, "app_main")
+        self.assertIn("clock_maintenance_quiet_fallback(timer_only, observer_ready)", boot)
+        self.assertLess(boot.index("clock_maintenance_quiet_fallback("), boot.index("rtc_clock_begin_normal_wake()"))
+        body = function_body(source, "clock_maintenance_quiet_fallback")
+        harness = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <setjmp.h>
+enum { BSP_BTN_GPIO=0, ESP_GPIO_WAKEUP_GPIO_LOW=0, ESP_OK=0 };
+static bool pending, time_trusted=true;
+static int gpio_error, aborts, sleeps, arms;
+static jmp_buf done;
+static bool clock_key_pending(void) { return pending; }
+static bool rtc_clock_abort_sleep(void) { ++aborts; return true; }
+static void auth_time_init(bool trusted) { time_trusted=trusted; }
+static int esp_deep_sleep_enable_gpio_wakeup(uint64_t pins,int level) {
+ assert(pins==1 && level==0); ++arms; return gpio_error;
+}
+static void esp_deep_sleep_start(void) { ++sleeps; longjmp(done,1); }
+static void clock_maintenance_quiet_fallback(bool timer_only,bool observer_ready) {
+""" + body + r"""
+}
+int main(void) {
+ clock_maintenance_quiet_fallback(false,true); assert(!aborts && !sleeps);
+ clock_maintenance_quiet_fallback(true,false); assert(!aborts && !sleeps);
+ pending=true; clock_maintenance_quiet_fallback(true,true); assert(!aborts && !sleeps);
+ pending=false; gpio_error=-1; clock_maintenance_quiet_fallback(true,true);
+ assert(aborts==1 && !sleeps && !time_trusted);
+ gpio_error=0; time_trusted=true;
+ if(!setjmp(done)) { clock_maintenance_quiet_fallback(true,true); assert(false); }
+ assert(aborts==2 && sleeps==1 && !time_trusted && arms==2);
+ return 0;
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "fallback.c").write_text(harness)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror",
+                            str(path / "fallback.c"), "-o", str(path / "fallback")], check=True)
+            subprocess.run([str(path / "fallback")], check=True)
 
     def test_terminal_anchor_follows_hardware_handoff(self):
         body = function_body((ROOT / "main/main.c").read_text(), "system_enter_deep_sleep")

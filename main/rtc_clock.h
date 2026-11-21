@@ -72,6 +72,18 @@ typedef enum {
 } rtc_clock_reference_result_t;
 
 rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference_t *reference);
+typedef enum {
+    RTC_CLOCK_MAINTENANCE_NONE = 0,
+    RTC_CLOCK_MAINTENANCE_ATTEMPT,
+    RTC_CLOCK_MAINTENANCE_OBSERVER,
+    RTC_CLOCK_MAINTENANCE_NOT_DUE,
+    RTC_CLOCK_MAINTENANCE_KEY,
+    RTC_CLOCK_MAINTENANCE_PREPARE,
+    RTC_CLOCK_MAINTENANCE_GPIO,
+    RTC_CLOCK_MAINTENANCE_COMMIT,
+    RTC_CLOCK_MAINTENANCE_REJECT
+} rtc_clock_maintenance_reason_t;
+void rtc_clock_note_maintenance(rtc_clock_maintenance_reason_t reason);
 bool rtc_clock_maintenance_due(bool timer_only);
 bool rtc_clock_prepare_maintenance(void);
 bool rtc_clock_abort_sleep(void);
@@ -102,6 +114,9 @@ typedef struct {
     uint64_t corrected_chain_us;
     uint64_t awake_total_us;
     uint32_t maintenance_count;
+    uint32_t maintenance_attempts;
+    uint32_t maintenance_failures;
+    uint32_t last_maintenance_reason;
     uint32_t learning_reason;
     rtc_clock_reference_result_t reference_status;
 } rtc_clock_diagnostics_t;

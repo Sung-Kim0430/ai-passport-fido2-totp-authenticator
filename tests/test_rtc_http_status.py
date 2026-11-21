@@ -313,6 +313,9 @@ int main(int argc, char **argv) {
     s_snapshot.clock.corrected_chain_us = UINT64_MAX;
     s_snapshot.clock.awake_total_us = UINT64_MAX;
     s_snapshot.clock.maintenance_count = UINT32_MAX;
+    s_snapshot.clock.maintenance_attempts = UINT32_MAX;
+    s_snapshot.clock.maintenance_failures = UINT32_MAX;
+    s_snapshot.clock.last_maintenance_reason = UINT32_MAX;
     s_snapshot.clock.learning_reason = UINT32_MAX;
     s_snapshot.clock.reference_status = RTC_CLOCK_REFERENCE_UNCERTAIN;
     time_probe_new_session();
@@ -356,6 +359,9 @@ int main(int argc, char **argv) {
                 for key in ("corrected_elapsed_us", "raw_chain_us", "corrected_chain_us", "awake_total_us"):
                     self.assertEqual(status["rtc"][key], 2**64 - 1)
                 self.assertEqual(status["rtc"]["maintenance_count"], 2**32 - 1)
+                self.assertEqual(status["rtc"]["maintenance_attempts"], 2**32 - 1)
+                self.assertEqual(status["rtc"]["maintenance_failures"], 2**32 - 1)
+                self.assertEqual(status["rtc"]["last_maintenance_reason"], 2**32 - 1)
                 self.assertEqual(status["rtc"]["learning_reason"], 2**32 - 1)
                 self.assertEqual(status["rtc"]["reference_status"], 2)
                 self.assertEqual(status["rtc"]["reconciled_elapsed_us"], 2**64 - 1)

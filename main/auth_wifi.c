@@ -463,7 +463,7 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"time_set\":%s,\"time_us\":%lld,\"time_sample_hrt_us\":%lld,\"time_sample_window_us\":%lld,\"time_sample_valid\":%s,"
         "\"time_probe\":{\"id\":%lu,\"hrt_us\":%lld,\"window_us\":%lld,\"valid\":%s},"
         "\"rtc\":{\"policy\":\"selected_source_ratio\",\"restored\":%s,\"reconciled_elapsed_us\":%llu,\"sdk_sample_valid\":%s,\"sdk_correction_us\":%lld,\"period_q19\":%lu,\"samples\":%lu,\"pre_tail_gap_upper_us\":%lu,\"fault\":%lu,\"maintenance_blocked\":%s,\"model_qualified\":%s,\"model_observations\":%lu,\"model_rms_millippm\":%lu,"
-        "\"source\":%lu,\"ppm\":%ld,\"ppm_qualified\":%s,\"corrected_elapsed_us\":%llu,\"raw_chain_us\":%llu,\"corrected_chain_us\":%llu,\"awake_total_us\":%llu,\"maintenance_count\":%lu,\"learning_reason\":%lu,\"reference_status\":%u}}",
+        "\"source\":%lu,\"ppm\":%ld,\"ppm_qualified\":%s,\"corrected_elapsed_us\":%llu,\"raw_chain_us\":%llu,\"corrected_chain_us\":%llu,\"awake_total_us\":%llu,\"maintenance_count\":%lu,\"maintenance_attempts\":%lu,\"maintenance_failures\":%lu,\"last_maintenance_reason\":%lu,\"learning_reason\":%lu,\"reference_status\":%u}}",
         s_identity.device_id, s_identity.ssid, s_session, (unsigned long long)time, count, brightness,
         sound ? "true" : "false", unlocked ? "true" : "false",
         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -486,6 +486,8 @@ static esp_err_t status_handler(httpd_req_t *req)
         clock_evidence.ppm_qualified ? "true" : "false", (unsigned long long)clock_evidence.corrected_elapsed_us,
         (unsigned long long)clock_evidence.raw_chain_us, (unsigned long long)clock_evidence.corrected_chain_us,
         (unsigned long long)clock_evidence.awake_total_us, (unsigned long)clock_evidence.maintenance_count,
+        (unsigned long)clock_evidence.maintenance_attempts, (unsigned long)clock_evidence.maintenance_failures,
+        (unsigned long)clock_evidence.last_maintenance_reason,
         (unsigned long)clock_evidence.learning_reason, (unsigned)clock_evidence.reference_status);
     if (len < 0 || (size_t)len >= sizeof(buf)) return httpd_resp_send_500(req);
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
