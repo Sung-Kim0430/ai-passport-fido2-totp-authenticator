@@ -93,12 +93,13 @@ static rtc_history_record_t sample(uint64_t n) {
     r.combined_uncertainty_us=n%1000;
     return r;
 }
-static void verify(const rtc_history_t &h,uint64_t n) {
+static void verify(const rtc_history_t &h,uint64_t n,uint64_t epoch_offset=0) {
     assert(h.generation==n && h.count==(n>100?100:n) && h.next==n%100);
     uint64_t watermark=n>100 ? sample(n-100).utc_end_us : 0;
     assert(h.evicted_utc_end_us==watermark);
     for(size_t i=0;i<h.count;++i) {
         rtc_history_record_t got, want=sample(n-h.count+i+1);
+        want.epoch+=epoch_offset;
         uint8_t a[80],b[80];
         assert(rtc_history_get(&h,i,&got));
         assert(rtc_history_encode(&got,a,80) && rtc_history_encode(&want,b,80));
@@ -146,7 +147,42 @@ static void checkpoints() {
         assert(rtc_history_get(&h,1,&last) && last.sequence==2 && h.generation==2);
     }
 }
+static void mode_capacity() {
+    Nor nor;
+    {
+        Engine e(nor); assert(e.init());
+        uint8_t namespaces[2]={e.ns,0};
+        assert(e.storage.createOrOpenNamespace("hist_freq",true,namespaces[1])==ESP_OK);
+        rtc_history_t rings[2]; rtc_history_store_t stores[2];
+        for(unsigned mode=0;mode<2;++mode) {
+            e.ns=namespaces[mode];
+            assert(rtc_history_store_open(&stores[mode],&rings[mode],e.io(),2)==RTC_HISTORY_STORE_MISSING);
+        }
+        for(uint64_t n=1;n<=650;++n) for(unsigned mode=0;mode<2;++mode) {
+            e.ns=namespaces[mode];
+            auto row=sample(n); row.epoch+=mode*100000;
+            assert(rtc_history_store_append(&stores[mode],&row,NULL)==RTC_HISTORY_STORE_VALID);
+            verify(rings[mode],n,mode*100000);
+        }
+        nvs_stats_t stats={}; assert(e.storage.fillStats(stats)==ESP_OK);
+        std::printf("mode capacity: bytes=%zu rows=%zu+%zu used_entries=%zu free_entries=%zu namespaces=%zu erases=%zu\n",
+            nor.bytes.size(),rings[0].count,rings[1].count,stats.used_entries,stats.free_entries,
+            stats.namespace_count,nor.erases);
+    }
+    {
+        Engine e(nor); assert(e.init(false));
+        for(const char *name : {"hist", "hist_freq"}) {
+            assert(e.storage.createOrOpenNamespace(name,false,e.ns)==ESP_OK);
+            rtc_history_t ring; rtc_history_store_t store;
+            assert(rtc_history_store_open(&store,&ring,e.io(),2)==RTC_HISTORY_STORE_VALID);
+            verify(ring,650,!std::strcmp(name,"hist")?0:100000);
+            assert(store.checkpoint.accepted_sequence==650 && store.checkpoint.dropped==0);
+        }
+    }
+}
+
 int main() {
+    mode_capacity();
     checkpoints();
     Nor security(24576);
     {

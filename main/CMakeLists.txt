@@ -6,6 +6,7 @@ idf_component_register(
          "rtc_history.c"
          "rtc_history_store.c"
          "rtc_clock.c"
+         "rtc_trace.c"
          "rtc_clock_platform.c"
          "rtc_light_sleep_platform.c"
          "rtc_wake_stub.c"

@@ -180,6 +180,7 @@ async function historyTests() {
   assert.notEqual(run("formatHttpError(503,'RTC_HISTORY_BLOCKED')"), run("formatHttpError(503,'RTC_HISTORY_IO_ERROR')"));
   assert.notEqual(run("formatHttpError(503,'RTC_HISTORY_NOT_READY')"), run("formatHttpError(423,'')"));
   assert.equal(run("formatHttpError(503,'busy').includes('锁屏')"), false);
+  assert.match(run("formatHttpError(422,'RTC_HISTORY_NOT_APPLICABLE')"), /石英/);
   const large='18446744073709551615';
   const row={sequence:large,source:2,utc_end_us:large,raw_us:large,raw_fraction_q19:524287,awake_delta_us:large,utc_delta_us:large,combined_uncertainty_us:large,flags:3,temperature_centi_c:-123,battery_mv:3800,temp_age_s:1,battery_age_s:2,epoch:'PRIVATE',session:'SECRET',account:'SECRET',reference_id:'PRIVATE'};
   const summary={ready:true,accepted_sequence:large,durable_sequence:'0',dropped:'0',save_budget_us:large,durable_count:0,pending_count:1,flags:0,store_status:0,save_result:0,active_ppm:-870,active_qualified:true,legacy_candidate_ppm:123,legacy_candidate_qualified:false,learning_reason:13,session:'SECRET',shadow:{version:1,source:2,result:2,samples:2,inliers:2,excluded:0,ppm:-869,uncertainty_ppm:1,holdout_baseline_error_us:2,holdout_candidate_error_us:1,holdout_present:true,holdout_improved:true,secret:'SECRET'}};
@@ -217,6 +218,10 @@ async function historyTests() {
   setup();let downloads=0;context.Blob=class {constructor(){downloads++;}};
   context.captureRequest=async()=>{throw new Error('timeout');};run('request=captureRequest');
   await run('rtcHistoryAction(true)');assert.equal(downloads,0);assert.match(elements.get('error').textContent,/timeout/);
+  assert.equal(run('busy'),false);
+  setup();context.captureRequest=async()=>{const e=new Error('mode');e.status=422;e.code='RTC_HISTORY_NOT_APPLICABLE';throw e;};run('request=captureRequest');
+  await run('rtcHistoryAction(true)');assert.equal(downloads,0);
+  assert.equal(elements.get('error').textContent,'');assert.match(elements.get('rtcSummary').textContent,/石英/);
   assert.equal(run('busy'),false);
   let saved, revoked=0;
   context.Blob=class {constructor(parts){saved=JSON.parse(parts[0]);}};

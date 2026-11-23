@@ -141,9 +141,12 @@ run_static_checks() (
         -o "${test_dir}/test_rtc_history_store"
     "${test_dir}/test_rtc_history_store"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
-        tests/test_rtc_clock.c main/rtc_history.c main/rtc_history_store.c main/rtc_drift.c -lm \
+        tests/test_rtc_clock.c main/rtc_trace.c main/rtc_history.c main/rtc_history_store.c main/rtc_drift.c -lm \
         -o "${test_dir}/test_rtc_clock"
     "${test_dir}/test_rtc_clock"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_rtc_trace.c main/rtc_trace.c -o "${test_dir}/test_rtc_trace"
+    "${test_dir}/test_rtc_trace"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_rtc_light_sleep.c -o "${test_dir}/test_rtc_light_sleep"
     "${test_dir}/test_rtc_light_sleep"
@@ -196,7 +199,9 @@ run_static_checks() (
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_clock_contract.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_trace_decoder.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_clock_platform.py
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_clock_mode_runtime.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_light_sleep_platform.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_history_platform.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_rtc_http_status.py

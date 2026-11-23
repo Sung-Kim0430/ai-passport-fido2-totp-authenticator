@@ -54,7 +54,7 @@ Write the focused regressions first and observe their expected failures before i
 ```bash
 cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_rtc_history_estimator.c main/rtc_history.c main/rtc_drift.c -lm -o /tmp/passport-rtc-estimator
 /tmp/passport-rtc-estimator
-cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_rtc_clock.c main/rtc_history.c main/rtc_history_store.c main/rtc_drift.c -lm -o /tmp/passport-rtc-clock
+cc -std=c11 -Wall -Wextra -Werror -Imain tests/test_rtc_clock.c main/rtc_trace.c main/rtc_history.c main/rtc_history_store.c main/rtc_drift.c -lm -o /tmp/passport-rtc-clock
 /tmp/passport-rtc-clock
 python3 tests/test_rtc_history_http.py
 node tests/test_web_companion.js

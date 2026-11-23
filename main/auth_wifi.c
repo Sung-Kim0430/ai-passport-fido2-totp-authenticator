@@ -352,6 +352,8 @@ static esp_err_t history_handler(httpd_req_t *req)
     unlocked = s_snapshot.unlocked;
     portEXIT_CRITICAL(&s_snapshot_lock);
     if (!unlocked) return error_response(req, "423 Locked", "Unlock the device first");
+    if (rtc_clock_get_mode() == RTC_MODE_XTAL)
+        return error_response(req, "422 Unprocessable Content", "RTC_HISTORY_NOT_APPLICABLE");
     uint64_t generation;
     size_t cursor;
     bool has_generation;

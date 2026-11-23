@@ -83,13 +83,28 @@ uint8_t auth_ui_totp_navigate(uint8_t total, uint8_t selected, auth_totp_view_t 
 
 auth_settings_window_t auth_ui_settings_window(uint8_t selected)
 {
-    static const uint8_t starts[] = {0, 3, 6, 9, 10, 13, 14, 15};
+    static const uint8_t starts[] = {0, 3, 6, 9, 10, 13, 15, 16};
     for (uint8_t group = 0; group < 7; group++) {
         if (selected < starts[group + 1]) {
             return (auth_settings_window_t){starts[group], starts[group + 1] - starts[group], group};
         }
     }
-    return (auth_settings_window_t){14, 1, 6};
+    return (auth_settings_window_t){AUTH_SETTINGS_EXIT_INDEX, 1, 6};
+}
+
+uint8_t auth_ui_clock_modes_next_selection(uint8_t selected, bool forward)
+{
+    if (selected >= AUTH_CLOCK_MODES_ITEM_COUNT) return 0;
+    if (forward) return (uint8_t)((selected + 1) % AUTH_CLOCK_MODES_ITEM_COUNT);
+    return selected ? (uint8_t)(selected - 1) : AUTH_CLOCK_MODES_BACK_INDEX;
+}
+
+uint8_t auth_ui_clock_modes_next_page(uint8_t page, bool forward)
+{
+    if (page == AUTH_CLOCK_MODES_PAGE_LIST) return page;
+    if (page > AUTH_CLOCK_MODES_PAGE_APPLY) return AUTH_CLOCK_MODES_PAGE_APPLY;
+    if (forward) return page < AUTH_CLOCK_MODES_PAGE_APPLY ? (uint8_t)(page + 1) : AUTH_CLOCK_MODES_PAGE_BEHAVIOR;
+    return page > AUTH_CLOCK_MODES_PAGE_BEHAVIOR ? (uint8_t)(page - 1) : AUTH_CLOCK_MODES_PAGE_APPLY;
 }
 
 #ifdef ESP_PLATFORM
@@ -122,6 +137,7 @@ static lv_obj_t *s_pnl_change_pass;
 static lv_obj_t *s_pnl_set_time;
 static lv_obj_t *s_pnl_lab;
 static lv_obj_t *s_pnl_fido_acc;
+static lv_obj_t *s_pnl_clock_modes;
 
 /* Lock view widgets */
 static lv_obj_t *s_lbl_lock_clock;
@@ -162,6 +178,14 @@ static lv_obj_t *s_lbl_st_hint;
 static lv_obj_t *s_lbl_lab_title;
 static lv_obj_t *s_lbl_lab_items[AUTH_LAB_ITEM_COUNT];
 
+/* Clock modes own their labels and styles; never reuse the shared Lab menu. */
+static lv_obj_t *s_lbl_clock_title;
+static lv_obj_t *s_lbl_clock_mode;
+static lv_obj_t *s_lbl_clock_page;
+static lv_obj_t *s_lbl_clock_body;
+static lv_obj_t *s_lbl_clock_action;
+static lv_obj_t *s_lbl_clock_items[AUTH_CLOCK_MODES_ITEM_COUNT];
+
 /* FIDO credential management widgets */
 static lv_obj_t *s_lbl_fido_acc_items[AUTH_MAX_FIDO_RPS];
 static lv_obj_t *s_lbl_fido_acc_msg;
@@ -174,6 +198,71 @@ static lv_color_t color_amber;
 static lv_color_t color_red;
 static lv_color_t color_text_pri;
 static lv_color_t color_text_mut;
+
+/* UI copy approved from Gemini 3.8 Flash, 2026-11-24. Keep assumptions explicit. */
+static const char *const s_clock_labels[RTC_MODE_COUNT] = {
+    "Eco Sleep",
+    "Frequent Cal",
+    "Quartz Holdover"
+};
+static const char *const s_clock_intro[RTC_MODE_COUNT] = {
+    "Eco mode enters deep sleep between updates, waking after 120 seconds initially and "
+    "then every 900 seconds for RTC calibration. Drift remains unresolved and time still "
+    "varies between manual phone syncs.",
+    "Frequent mode wakes after 120 seconds then every 180 seconds using an independent "
+    "calibration model. This mode is experimental and has not demonstrated proven "
+    "improvements in clock accuracy over standard Eco mode.",
+    "Quartz holdover keeps the CPU awake with display off, disabling automatic sleep. The "
+    "system timer stops in light sleep, so active CPU execution is required; keeping the "
+    "crystal powered alone is not quartz holdover."
+};
+static const char *const s_clock_estimates[RTC_MODE_COUNT] = {
+    "With an illustrative 450mAh usable capacity, an assumed 0.2 to 0.5mA draw gives 37 to "
+    "94 days. Illustrative whole-board current is not measured; true battery life requires "
+    "physical bench testing.",
+    "If measured total average current is 0.3 to 0.6mA with 450mAh usable capacity, runtime "
+    "is 31 to 63 days. These are assumptions, not measurements. Illustrative whole-board "
+    "current is not measured.",
+    "With an illustrative 450mAh usable capacity, an assumed 10 to 25mA draw gives 18 to 45 "
+    "hours. Illustrative whole-board current is not measured; active CPU load requires "
+    "physical validation."
+};
+static const char *const s_clock_notes[RTC_MODE_COUNT] = {
+    "Eco single-run drift of 26.74s fast over 48.82h is not a precision guarantee. The root "
+    "cause of current drift remains unresolved on the device.",
+    "Accuracy unmeasured, independent initially uncalibrated. Phone sync windows across sleep required; more wakes alone cannot fix bias.",
+    "The device uses a standard quartz crystal with no TCXO claim. An illustrative 10 ppm "
+    "drift converts to 0.864 seconds per day, but actual accuracy is unverified."
+};
+static const struct {
+    const char *title;
+    const char *apply;
+    const char *active;
+    const char *confirm;
+    const char *save_failed;
+    const char *switch_warning;
+    const char *back;
+    const char *how;
+    const char *standby;
+    const char *accuracy;
+    const char *apply_page;
+    const char *footer_list;
+    const char *footer_detail;
+} s_clock_copy = {
+    .title = "Clock Mode",
+    .apply = "Apply",
+    .active = "Active",
+    .confirm = "Restart device now?",
+    .save_failed = "Save Failed",
+    .switch_warning = "Device restarts to switch mode. Unsaved calibration is lost (durable records remain); fresh phone sync is required after restart.",
+    .back = "Back",
+    .how = "How It Works",
+    .standby = "Standby",
+    .accuracy = "Accuracy",
+    .apply_page = "Apply",
+    .footer_list = "UP/DOWN choose OK details Hold back",
+    .footer_detail = "UP/DOWN pages OK next Hold back",
+};
 
 void auth_ui_init(void)
 {
@@ -554,8 +643,62 @@ void auth_ui_init(void)
     auth_ui_set_view(AUTH_VIEW_LOCK);
 }
 
+static lv_obj_t *clock_label(int y, const lv_font_t *font, lv_color_t color)
+{
+    lv_obj_t *label = lv_label_create(s_pnl_clock_modes);
+    lv_obj_set_width(label, 208);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, color, 0);
+    lv_obj_set_pos(label, 0, y);
+    lv_label_set_text(label, "");
+    return label;
+}
+
+static void create_clock_modes_panel(void)
+{
+    if (s_pnl_clock_modes) return;
+    s_pnl_clock_modes = lv_obj_create(s_root_screen);
+    lv_obj_set_size(s_pnl_clock_modes, 230, 246);
+    lv_obj_align(s_pnl_clock_modes, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(s_pnl_clock_modes, color_card, 0);
+    lv_obj_set_style_border_color(s_pnl_clock_modes, lv_color_hex(0x30363D), 0);
+    lv_obj_set_style_border_width(s_pnl_clock_modes, 1, 0);
+    lv_obj_set_style_radius(s_pnl_clock_modes, 8, 0);
+    lv_obj_set_style_pad_all(s_pnl_clock_modes, 10, 0);
+    lv_obj_remove_flag(s_pnl_clock_modes, LV_OBJ_FLAG_SCROLLABLE);
+    s_lbl_clock_title = clock_label(0, &lv_font_montserrat_14, color_amber);
+    set_label_text_if_changed(s_lbl_clock_title, s_clock_copy.title);
+    s_lbl_clock_mode = clock_label(24, &lv_font_montserrat_14, color_cyan);
+    s_lbl_clock_page = clock_label(46, &lv_font_montserrat_12, color_text_mut);
+    s_lbl_clock_body = clock_label(66, &lv_font_montserrat_12, color_text_pri);
+    lv_obj_set_style_text_line_space(s_lbl_clock_body, 2, 0);
+    s_lbl_clock_action = clock_label(174, &lv_font_montserrat_14, color_amber);
+    for (unsigned row = 0; row < AUTH_CLOCK_MODES_ITEM_COUNT; row++) {
+        s_lbl_clock_items[row] = clock_label(54 + (int)row * 36, &lv_font_montserrat_14, color_text_pri);
+        lv_obj_set_height(s_lbl_clock_items[row], 32);
+        lv_obj_set_style_pad_all(s_lbl_clock_items[row], 6, 0);
+        lv_obj_set_style_radius(s_lbl_clock_items[row], 5, 0);
+        lv_obj_set_style_bg_color(s_lbl_clock_items[row], lv_color_hex(0x263C3B), 0);
+    }
+}
+
+static void delete_clock_modes_panel(void)
+{
+    if (!s_pnl_clock_modes) return;
+    lv_obj_delete(s_pnl_clock_modes);
+    s_pnl_clock_modes = NULL;
+    s_lbl_clock_title = s_lbl_clock_mode = s_lbl_clock_page = NULL;
+    s_lbl_clock_body = s_lbl_clock_action = NULL;
+    memset(s_lbl_clock_items, 0, sizeof(s_lbl_clock_items));
+}
+
 void auth_ui_set_view(auth_view_t view)
 {
+    if (view != AUTH_VIEW_CLOCK_MODES) delete_clock_modes_panel();
+    lv_obj_set_style_pad_ver(s_bottom_bar, view == AUTH_VIEW_CLOCK_MODES ? 0 : 4, 0);
+    lv_obj_set_width(s_lbl_footer_hint, view == AUTH_VIEW_CLOCK_MODES ? 230 : LV_SIZE_CONTENT);
+    lv_obj_set_style_text_align(s_lbl_footer_hint, view == AUTH_VIEW_CLOCK_MODES ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT, 0);
     s_current_view = view;
 
     lv_obj_add_flag(s_pnl_lock, LV_OBJ_FLAG_HIDDEN);
@@ -598,6 +741,10 @@ void auth_ui_set_view(auth_view_t view)
     case AUTH_VIEW_WIFI:
         lv_obj_clear_flag(s_pnl_lab, LV_OBJ_FLAG_HIDDEN);
         set_label_text_if_changed(s_lbl_footer_hint, LV_SYMBOL_UP "/" LV_SYMBOL_DOWN " Move  " LV_SYMBOL_OK " Select  Hold:Back");
+        break;
+    case AUTH_VIEW_CLOCK_MODES:
+        create_clock_modes_panel();
+        set_label_text_if_changed(s_lbl_footer_hint, s_clock_copy.footer_list);
         break;
     case AUTH_VIEW_FIDO_ACCOUNTS:
         lv_obj_clear_flag(s_pnl_fido_acc, LV_OBJ_FLAG_HIDDEN);
@@ -1018,11 +1165,74 @@ void auth_ui_update_settings(uint8_t selected_idx, uint8_t brightness,
             snprintf(buf, sizeof(buf), "%s Lab / Experiments", mark);
             if (selected_idx == i) color = color_amber;
             break;
-        case 14: snprintf(buf, sizeof(buf), "%s Exit to TOTP", mark); break;
+        case AUTH_SETTINGS_CLOCK_MODES_INDEX: snprintf(buf, sizeof(buf), "%s %s", mark, s_clock_copy.title); break;
+        case AUTH_SETTINGS_EXIT_INDEX: snprintf(buf, sizeof(buf), "%s Exit to TOTP", mark); break;
         }
         set_label_text_if_changed(row, buf);
         lv_obj_set_style_text_color(row, color, 0);
     }
+}
+
+void auth_ui_update_clock_modes(rtc_mode_t active, uint8_t selected, uint8_t page,
+                                bool confirming, bool save_failed)
+{
+    if (s_current_view != AUTH_VIEW_CLOCK_MODES) return;
+    if (selected >= AUTH_CLOCK_MODES_ITEM_COUNT) selected = 0;
+    if (page > AUTH_CLOCK_MODES_PAGE_APPLY) page = AUTH_CLOCK_MODES_PAGE_APPLY;
+    if (selected == AUTH_CLOCK_MODES_BACK_INDEX) page = AUTH_CLOCK_MODES_PAGE_LIST;
+    bool list = page == AUTH_CLOCK_MODES_PAGE_LIST;
+    char text[128];
+    lv_obj_t *details[] = {s_lbl_clock_page, s_lbl_clock_body, s_lbl_clock_action};
+    for (unsigned i = 0; i < sizeof(details) / sizeof(details[0]); i++) {
+        if (list) lv_obj_add_flag(details[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_remove_flag(details[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (unsigned row = 0; row < AUTH_CLOCK_MODES_ITEM_COUNT; row++) {
+        lv_obj_t *label = s_lbl_clock_items[row];
+        if (!list) {
+            lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+        lv_obj_remove_flag(label, LV_OBJ_FLAG_HIDDEN);
+        snprintf(text, sizeof(text), "%s %s", selected == row ? ">" : " ",
+                 row == AUTH_CLOCK_MODES_BACK_INDEX ? s_clock_copy.back : s_clock_labels[row]);
+        set_label_text_if_changed(label, text);
+        lv_obj_set_style_bg_opa(label, selected == row ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(label, selected == row ? color_cyan : color_text_pri, 0);
+    }
+    if (list) {
+        snprintf(text, sizeof(text), "%s: %s", s_clock_copy.active,
+                 (unsigned)active < RTC_MODE_COUNT ? s_clock_labels[active] : "--");
+        set_label_text_if_changed(s_lbl_clock_mode, text);
+        set_label_text_if_changed(s_lbl_footer_hint, s_clock_copy.footer_list);
+        return;
+    }
+    set_label_text_if_changed(s_lbl_clock_mode, s_clock_labels[selected]);
+    const char *const pages[] = {"", s_clock_copy.how, s_clock_copy.standby,
+                                s_clock_copy.accuracy, s_clock_copy.apply_page};
+    snprintf(text, sizeof(text), "%s  %u/4", pages[page], page);
+    set_label_text_if_changed(s_lbl_clock_page, text);
+    set_label_text_if_changed(s_lbl_footer_hint, s_clock_copy.footer_detail);
+    if (page != AUTH_CLOCK_MODES_PAGE_APPLY) {
+        const char *body = page == AUTH_CLOCK_MODES_PAGE_BEHAVIOR ? s_clock_intro[selected] :
+                           page == AUTH_CLOCK_MODES_PAGE_STANDBY ? s_clock_estimates[selected] :
+                           s_clock_notes[selected];
+        set_label_text_if_changed(s_lbl_clock_body, body);
+        lv_obj_add_flag(s_lbl_clock_action, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    bool is_active = selected == (uint8_t)active;
+    set_label_text_if_changed(s_lbl_clock_body, is_active ? "" : s_clock_copy.switch_warning);
+    const char *action = is_active ? s_clock_copy.active :
+                         confirming ? s_clock_copy.confirm : s_clock_copy.apply;
+    if (save_failed && !is_active) snprintf(text, sizeof(text), "%s\n%s", s_clock_copy.save_failed, action);
+    else snprintf(text, sizeof(text), "%s", action);
+    set_label_text_if_changed(s_lbl_clock_action, text);
+    lv_obj_set_style_text_color(s_lbl_clock_action, is_active ? color_cyan : save_failed ? color_red : color_amber, 0);
+    /* Reuse approved control phrases; confirmation describes the action of the next OK. */
+    snprintf(text, sizeof(text), "OK %s\nHold back", is_active ? s_clock_copy.back :
+             confirming ? s_clock_copy.confirm : s_clock_copy.apply);
+    set_label_text_if_changed(s_lbl_footer_hint, text);
 }
 
 void auth_ui_update_change_passcode(uint8_t step, const char *input_str, uint8_t input_len,

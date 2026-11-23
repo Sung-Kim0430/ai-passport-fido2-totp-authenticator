@@ -200,6 +200,7 @@ static bool save_byte(const char *key, uint8_t value)
 #else
 static uint8_t s_host_pin_failures;
 static auth_totp_view_t s_host_totp_view;
+static uint8_t s_host_clock_mode;
 #endif
 
 bool auth_storage_pin_failures_load(uint8_t *count)
@@ -245,6 +246,32 @@ bool auth_storage_totp_view_save(auth_totp_view_t mode)
     return save_byte("totp_view", (uint8_t)mode);
 #else
     s_host_totp_view = mode;
+    return true;
+#endif
+}
+
+bool auth_storage_clock_mode_load(rtc_mode_t *mode)
+{
+    if (!mode) return false;
+    *mode = RTC_MODE_ECO;
+#ifdef ESP_PLATFORM
+    uint8_t value;
+    if (!load_byte("clock_mode", &value)) return false;
+#else
+    const uint8_t value = s_host_clock_mode;
+#endif
+    if (!rtc_mode_valid((rtc_mode_t)value)) return false;
+    *mode = (rtc_mode_t)value;
+    return true;
+}
+
+bool auth_storage_clock_mode_save(rtc_mode_t mode)
+{
+    if (!rtc_mode_valid(mode)) return false;
+#ifdef ESP_PLATFORM
+    return save_byte("clock_mode", (uint8_t)mode);
+#else
+    s_host_clock_mode = (uint8_t)mode;
     return true;
 #endif
 }

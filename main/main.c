@@ -17,6 +17,7 @@
 #include "auth_storage.h"
 #include "rtc_clock.h"
 #include "rtc_light_sleep.h"
+#include "rtc_trace.h"
 #include "totp_crypto.h"
 #include "passcode_guard.h"
 #include "fido_protocol.h"
@@ -36,6 +37,7 @@
 #include "soc/rtc_cntl_reg.h"
 #include "nvs_flash.h"
 #include "esp_pm.h"
+#include "esp_lcd_panel_ops.h"
 #include "lvgl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -43,6 +45,7 @@
 #include "driver/usb_serial_jtag.h"
 #include "driver/gpio.h"
 #include "hal/gpio_ll.h"
+#include "hal/rtc_cntl_ll.h"
 #include "esp_intr_alloc.h"
 #include "soc/gpio_reg.h"
 #include "soc/gpio_struct.h"
@@ -58,6 +61,7 @@ typedef enum {
     EVT_FIDO_REQ,
     EVT_TICK,
     EVT_SLEEP,
+    EVT_KEY_IDLE,
 } app_event_type_t;
 
 typedef struct {
@@ -87,6 +91,15 @@ static uint8_t s_settings_idx = 0;
 static uint8_t s_change_pin_step = 0;
 static uint8_t s_lab_idx = 0;
 static uint8_t s_wifi_idx = 0;
+static uint8_t s_clock_mode_idx;
+static uint8_t s_clock_mode_page;
+static bool s_clock_mode_confirm;
+static bool s_clock_mode_save_failed;
+static bool s_quartz_blank;
+static bool s_quartz_wake_guard;
+static void on_ble_cmd(const fido_parsed_cmd_t *cmd);
+static bool quartz_standby_enter(void);
+static void quartz_standby_wake(void);
 static uint8_t s_fido_acc_idx = 0;
 static bool s_fido_acc_confirm = false;
 static auth_fido_site_t s_fido_rps[AUTH_MAX_FIDO_RPS];
@@ -169,6 +182,9 @@ static void IRAM_ATTR clock_key_isr(void *argument)
  * bootloader so GPIO21 stays clamped low and held across ROM/bootloader entry. */
 void RTC_IRAM_ATTR esp_wake_deep_sleep(void)
 {
+    const uint64_t wake_tick = rtc_cntl_ll_get_rtc_time();
+    rtc_trace_store.wake_tick = wake_tick;
+    rtc_trace_store.wake_tick_inverse = ~wake_tick;
     esp_default_wake_deep_sleep();
 #if CONFIG_IDF_TARGET_ESP32C3
     gpio_ll_pullup_dis(&GPIO, BSP_LCD_BL);
@@ -272,6 +288,10 @@ static void clock_maintenance_quiet_fallback(bool timer_only, bool observer_read
 
 static void system_enter_deep_sleep(void)
 {
+    if (!rtc_mode_deep_sleep(rtc_clock_get_mode())) {
+        (void)quartz_standby_enter();
+        return;
+    }
     ESP_LOGI(TAG, "Entering terminal deep sleep...");
 
     /* 1. Never cut the radios while the wake button is still held, or the
@@ -455,6 +475,53 @@ static void sound_hint(void)
     play_tone(2000, 80);
 }
 
+static bool clock_mode_apply(rtc_mode_t mode)
+{
+    if (!rtc_mode_valid(mode) || mode == rtc_clock_get_mode()) return false;
+    s_clock_mode_save_failed = !auth_storage_clock_mode_save(mode);
+    if (s_clock_mode_save_failed) return false;
+    auth_time_init(false);
+    esp_restart();
+    return true;
+}
+
+static bool quartz_standby_enter(void)
+{
+    if (s_quartz_blank) return true;
+    if (rtc_clock_get_mode() != RTC_MODE_XTAL ||
+        bsp_button_read_mv() < BSP_BTN_MV_RELEASED_MIN) return false;
+    if (!auth_wifi_ap_stop() || !auth_ble_stop()) return false;
+    audio_off_now();
+    if (!bsp_lvgl_lock(1000)) return false;
+    bsp_display_backlight(0);
+    const esp_err_t err = esp_lcd_panel_disp_on_off(bsp_display_panel(), false);
+    if (err != ESP_OK) bsp_display_backlight(s_cfg.brightness);
+    bsp_lvgl_unlock();
+    if (err != ESP_OK) return false;
+    s_session_unlocked = false;
+    passcode_guard_lock(&s_guard);
+    auth_enter_view(AUTH_VIEW_LOCK);
+    s_quartz_wake_guard = false;
+    s_quartz_blank = true;
+    return true;
+}
+
+static void quartz_standby_wake(void)
+{
+    if (!s_quartz_blank || !bsp_lvgl_lock(1000)) return;
+    const esp_err_t err = esp_lcd_panel_disp_on_off(bsp_display_panel(), true);
+    if (err == ESP_OK) bsp_display_backlight(s_cfg.brightness);
+    bsp_lvgl_unlock();
+    if (err != ESP_OK) return;
+    s_quartz_blank = false;
+    s_quartz_wake_guard = true;
+    s_last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    if (s_lab_cfg.ble_fido_enabled) {
+        if (auth_ble_init(on_ble_cmd)) auth_ble_start_advertising();
+        else ESP_LOGW(TAG, "BLE restart after quartz standby failed");
+    }
+}
+
 static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
 {
     (void)user;
@@ -462,6 +529,10 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
     if (key_guard_consume(&s_key_guard, ev == BSP_BTN_IDLE)) {
         if (was_armed && !s_key_guard.armed) {
             ESP_LOGI(TAG, "Button gestures idle, boot guard disarmed");
+        }
+        if (ev == BSP_BTN_IDLE && !was_armed && s_input_ready && s_evt_queue) {
+            const app_event_t idle = {.type = EVT_KEY_IDLE};
+            (void)xQueueSend(s_evt_queue, &idle, 0);
         }
         return;
     }
@@ -505,7 +576,8 @@ static uint8_t settings_action_for_index(uint8_t idx)
     case 11: return 9;
     case 12: return 10;
     case 13: return 13;
-    case 14: return 12;
+    case 14: return 15;
+    case 15: return 12;
     default: return idx;
     }
 }
@@ -608,6 +680,7 @@ static void battery_environment_for_frame(uint64_t now_ms)
 
 static void refresh_display(void)
 {
+    if (s_quartz_blank) return;
     auth_view_t view = auth_ui_get_view();
     uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
     uint64_t current_unix = auth_get_current_timestamp(&s_cfg);
@@ -711,6 +784,10 @@ static void refresh_display(void)
     } else if (view == AUTH_VIEW_LAB) {
         auth_ui_update_lab(s_lab_idx, s_lab_cfg.ble_fido_enabled,
                            s_lab_cfg.console_log_enabled, s_fido_reset_confirm);
+    } else if (view == AUTH_VIEW_CLOCK_MODES) {
+        auth_ui_update_clock_modes(rtc_clock_get_mode(), s_clock_mode_idx,
+                                   s_clock_mode_page, s_clock_mode_confirm,
+                                   s_clock_mode_save_failed);
     } else if (view == AUTH_VIEW_WIFI) {
         const auth_identity_t *identity = auth_wifi_get_identity();
         auth_ui_update_wifi(s_wifi_idx, auth_wifi_ap_is_active(),
@@ -792,11 +869,17 @@ static void auth_app_task(void *param)
         memcpy(s_settings_before, &s_cfg, sizeof(s_settings_before));
         s_settings_write_failed = false;
 
+        if (evt.type == EVT_KEY_IDLE) {
+            s_quartz_wake_guard = false;
+            continue;
+        }
+
         if (evt.type == EVT_TICK) {
             audio_idle(now_ms);
             // 采样和模型写入只在应用工作任务，确认请求期间先不增加延迟。
             if (s_fido.state != FIDO_STATE_UP_PENDING) rtc_clock_tick();
             auth_wifi_history_service(s_session_unlocked);
+            if (s_quartz_blank) continue;
             uint32_t now = (uint32_t)now_ms;
             bool active = auth_ui_get_view() == AUTH_VIEW_FIDO_PROMPT ||
                           auth_ble_is_connected() || auth_wifi_ap_is_active();
@@ -825,6 +908,10 @@ static void auth_app_task(void *param)
         if (evt.type == EVT_FIDO_REQ) {
             s_last_activity_ms = (uint32_t)now_ms;
             const fido_parsed_cmd_t *cmd = &evt.data.fido_cmd;
+            if (s_quartz_blank) {
+                auth_wifi_command_result(cmd->request_id, false);
+                continue;
+            }
             if (s_cfg.auto_wipe_enabled && s_guard.failed_attempts > PASSCODE_WIPE_ATTEMPTS) {
                 auth_wifi_command_result(cmd->request_id, false);
                 continue;
@@ -917,6 +1004,12 @@ static void auth_app_task(void *param)
 
         if (evt.type == EVT_KEY) {
             if (evt.data.key.when_ms <= s_ignore_key_before_ms) continue;
+            if (s_quartz_blank) {
+                quartz_standby_wake();
+                refresh_display();
+                continue;
+            }
+            if (s_quartz_wake_guard) continue;
             s_last_activity_ms = (uint32_t)now_ms;
             bsp_btn_t btn = evt.data.key.btn;
             bsp_btn_ev_t kev = evt.data.key.ev;
@@ -1175,6 +1268,12 @@ static void auth_app_task(void *param)
                                 s_totp_view = next;
                                 sound_click();
                             } else sound_fail();
+                        } else if (s_settings_idx == 15) {
+                            s_clock_mode_idx = (uint8_t)rtc_clock_get_mode();
+                            s_clock_mode_page = 0;
+                            s_clock_mode_confirm = false;
+                            s_clock_mode_save_failed = false;
+                            auth_enter_view(AUTH_VIEW_CLOCK_MODES);
                         }
                         s_settings_idx = ui_idx;
                     }
@@ -1186,6 +1285,40 @@ static void auth_app_task(void *param)
                 refresh_display();
             }
             /* --- 4b. Lab / Experiments Handling --- */
+            else if (view == AUTH_VIEW_CLOCK_MODES) {
+                if (kev == BSP_BTN_LONG && btn == BSP_BTN_OK) {
+                    if (s_clock_mode_page) s_clock_mode_page = 0;
+                    else auth_enter_view(AUTH_VIEW_SETTINGS);
+                    s_clock_mode_confirm = false;
+                    s_clock_mode_save_failed = false;
+                } else if (kev == BSP_BTN_CLICK) {
+                    if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
+                        const bool forward = btn == BSP_BTN_DOWN;
+                        s_clock_mode_confirm = false;
+                        s_clock_mode_save_failed = false;
+                        if (!s_clock_mode_page) {
+                            s_clock_mode_idx = auth_ui_clock_modes_next_selection(s_clock_mode_idx, forward);
+                        } else {
+                            s_clock_mode_page = auth_ui_clock_modes_next_page(s_clock_mode_page, forward);
+                        }
+                    } else if (btn == BSP_BTN_OK) {
+                        if (!s_clock_mode_page) {
+                            if (s_clock_mode_idx == RTC_MODE_COUNT) auth_enter_view(AUTH_VIEW_SETTINGS);
+                            else s_clock_mode_page = 1;
+                        } else if (s_clock_mode_page < 4) {
+                            ++s_clock_mode_page;
+                        } else if (s_clock_mode_idx == (uint8_t)rtc_clock_get_mode()) {
+                            s_clock_mode_page = 0;
+                        } else if (!s_clock_mode_confirm) {
+                            s_clock_mode_confirm = true;
+                        } else {
+                            (void)clock_mode_apply((rtc_mode_t)s_clock_mode_idx);
+                            s_clock_mode_confirm = false;
+                        }
+                    }
+                }
+                refresh_display();
+            }
             else if (view == AUTH_VIEW_WIFI) {
                 if (kev == BSP_BTN_CLICK) {
                     if (btn == BSP_BTN_UP || btn == BSP_BTN_DOWN) {
@@ -1443,7 +1576,8 @@ static void auth_app_task(void *param)
 static void init_power_management(void)
 {
 #if CONFIG_PM_ENABLE
-    const bool light_ready = rtc_clock_start_light_sleep();
+    const bool light_ready = rtc_mode_light_sleep(rtc_clock_get_mode()) &&
+                             rtc_clock_start_light_sleep();
     esp_pm_config_t pm_config = {
         .max_freq_mhz = 160,
         .min_freq_mhz = 40,
@@ -1483,6 +1617,16 @@ void app_main(void)
     if (nvs_err != ESP_OK) {
         clock_key_observer_end();
         ESP_LOGE(TAG, "NVS initialization failed; stored credentials were not erased: %s", esp_err_to_name(nvs_err));
+        return;
+    }
+
+    rtc_mode_t clock_mode = RTC_MODE_ECO;
+    if (!auth_storage_clock_mode_load(&clock_mode)) {
+        ESP_LOGW(TAG, "Clock preference unavailable; using Eco without overwriting it");
+    }
+    if (!rtc_clock_configure_mode(clock_mode)) {
+        clock_key_observer_end();
+        ESP_LOGE(TAG, "Clock mode configuration failed");
         return;
     }
 

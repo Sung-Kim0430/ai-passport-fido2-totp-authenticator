@@ -5,6 +5,7 @@
 #include "auth_fido_store.h"
 #include <stdint.h>
 #include "rtc_clock.h"
+#include "rtc_mode.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +64,8 @@ bool auth_storage_pin_failures_load(uint8_t *failures);
 bool auth_storage_pin_failures_save(uint8_t failures);
 bool auth_storage_totp_view_load(auth_totp_view_t *view);
 bool auth_storage_totp_view_save(auth_totp_view_t view);
+bool auth_storage_clock_mode_load(rtc_mode_t *mode);
+bool auth_storage_clock_mode_save(rtc_mode_t mode);
 
 // 元数据修改成功才推进版本；调用方借版本拒绝旧列表索引上的误操作。
 bool auth_storage_add_account(auth_config_t *cfg, const char *issuer,

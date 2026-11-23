@@ -41,7 +41,9 @@ function controls() {
   const steam = $('algorithm').value === '3';
   $('digits').disabled = !enabled || steam; $('period').disabled = !enabled || steam;
 }
+const quartzHistoryMessage = "石英模式不使用RC校准历史；手机时间同步仍有效；切回其他模式即可查看相应记录。";
 function formatHttpError(code, raw) {
+  if (code === 422 && raw === "RTC_HISTORY_NOT_APPLICABLE") return quartzHistoryMessage;
   const historyErrors = {"RTC_HISTORY_IO_ERROR": "历史存储暂不可读，请稍后刷新重试。", "RTC_HISTORY_BLOCKED": "历史校准存储不兼容或损坏，需检查固件及存储状态。", "RTC_HISTORY_NOT_READY": "历史数据尚未准备好，请稍后刷新。"};
   if (code === 503 && Object.hasOwn(historyErrors, raw)) return historyErrors[raw];
   const map = {400:'输入内容或参数有误，请检查后重试',403:'页面会话已过期，请点击“刷新列表”后重试',413:'提交内容过长，请精简后再试',415:'请求格式不支持',423:'设备处于锁屏状态，请先在机身上解锁',503:"设备当前正忙，请稍后重试。",504:"历史读取超时，请稍后重试。"};
@@ -59,7 +61,7 @@ async function request(path, options, timeoutMs = 5000) {
       if (!response.ok) {
         const raw = await response.text();
         const error = new Error(formatHttpError(response.status, raw));
-        error.status = response.status; throw error;
+        error.status = response.status; error.code = raw; throw error;
       }
       return response.json();
     })(),deadline]);
@@ -294,7 +296,12 @@ async function rtcHistoryAction(download) {
       finally { URL.revokeObjectURL(url); }
       message('校准历史完整导出；不含账号、设备标识或会话凭据');
     }
-  } catch(e) { $('rtcRows').textContent = ''; $('rtcSummary').textContent = '读取失败，未下载不完整文件。'; message(e.message,true); }
+  } catch(e) {
+    $('rtcRows').textContent = '';
+    if (e.status === 422 && e.code === 'RTC_HISTORY_NOT_APPLICABLE') {
+      $('rtcSummary').textContent = quartzHistoryMessage; message(quartzHistoryMessage);
+    } else { $('rtcSummary').textContent = '读取失败，未下载不完整文件。'; message(e.message,true); }
+  }
   finally { busy = false; controls(); }
 }
 $('rtcRefresh').addEventListener('click', () => rtcHistoryAction(false));

@@ -115,6 +115,21 @@ int main(void)
     assert(auth_storage_totp_view_save(AUTH_TOTP_VIEW_LIST4));
     assert(auth_storage_totp_view_load(&mode) && mode == AUTH_TOTP_VIEW_LIST4);
     assert(auth_storage_totp_view_save(AUTH_TOTP_VIEW_CARD));
+    rtc_mode_t clock_mode = RTC_MODE_XTAL;
+    assert(auth_storage_clock_mode_load(&clock_mode) && clock_mode == RTC_MODE_ECO);
+    assert(!auth_storage_clock_mode_load(NULL));
+    for (unsigned value = 0; value < RTC_MODE_COUNT; ++value) {
+        assert(auth_storage_clock_mode_save((rtc_mode_t)value));
+        assert(auth_storage_init(&cfg));
+        assert(auth_storage_clock_mode_load(&clock_mode) && clock_mode == (rtc_mode_t)value);
+        assert(cfg.account_count == 0);
+    }
+    assert(!auth_storage_clock_mode_save((rtc_mode_t)RTC_MODE_COUNT));
+    assert(!auth_storage_clock_mode_save((rtc_mode_t)-1));
+    assert(auth_storage_clock_mode_load(&clock_mode) && clock_mode == RTC_MODE_XTAL);
+    s_host_clock_mode = 255;
+    assert(!auth_storage_clock_mode_load(&clock_mode) && clock_mode == RTC_MODE_ECO);
+    assert(s_host_clock_mode == 255);
     puts("Account validation, migration, clock and independent preferences: PASS");
     return 0;
 }

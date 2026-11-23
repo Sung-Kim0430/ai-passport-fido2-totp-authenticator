@@ -84,6 +84,7 @@ int main(void) {
 #include <string.h>
 #undef RTC_CLOCK_VERSION
 #define RTC_CLOCK_VERSION 99u
+rtc_mode_t rtc_clock_get_mode(void) { return RTC_MODE_ECO; }
 typedef int nvs_handle_t;
 typedef int esp_err_t;
 enum { ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_NVS_NOT_FOUND = 0x1102,
@@ -270,6 +271,9 @@ int main(void) {
     assert(rtc_clock_platform_arm_interval(UINT64_C(120000000)));
     assert(enables == 1 && interval == UINT64_C(120000000) && disables == 0);
     reset();
+    assert(rtc_clock_platform_arm_interval(UINT64_C(180000000)));
+    assert(enables == 1 && interval == UINT64_C(180000000) && disables == 0);
+    reset();
     assert(!rtc_clock_platform_arm_interval(0));
     assert(wake_sources == GPIO_WAKE && disables == 1 && enables == 0);
     reset(); enable_error = ESP_FAIL;
@@ -321,6 +325,7 @@ enum { ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_NVS_NOT_FOUND = 0x1102,
        SOC_RTC_SLOW_CLK_SRC_RC_SLOW = 0, SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 = 2 };
 #undef RTC_CLOCK_VERSION
 #define RTC_CLOCK_VERSION 99u
+rtc_mode_t rtc_clock_get_mode(void) { return RTC_MODE_ECO; }
 static uint32_t current_source;
 uint32_t rtc_clock_platform_source(void) { return current_source; }
 static unsigned char blob[256];
@@ -419,6 +424,143 @@ int main(void) {
             source.write_text(declarations + functions + cases, encoding="utf-8")
             subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", "-Imain", str(source), "main/rtc_drift.c", "-lm", "-o", str(binary)], cwd=ROOT, check=True)
             subprocess.run([str(binary)], check=True)
+
+
+    def test_actual_mode_isolation_for_coefficients_models_and_history(self):
+        platform = (ROOT / "main/rtc_clock_platform.c").read_text()
+        core = (ROOT / "main/rtc_clock.c").read_text()
+        code = r'''
+#include "rtc_clock_internal.h"
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+typedef int nvs_handle_t;
+typedef int esp_err_t;
+enum { ESP_OK=0, ESP_FAIL=-1, ESP_ERR_NVS_NOT_FOUND=1, ESP_ERR_NVS_INVALID_LENGTH=2,
+       ESP_ERR_NVS_NO_FREE_PAGES=3, ESP_ERR_NVS_NEW_VERSION_FOUND=4,
+       NVS_READONLY=0, NVS_READWRITE=1,
+       SOC_RTC_SLOW_CLK_SRC_RC_SLOW=0, SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256=2 };
+static rtc_mode_t selected_mode;
+static uint32_t selected_source=2;
+static unsigned opens, writes;
+rtc_mode_t rtc_clock_get_mode(void) { return selected_mode; }
+uint32_t rtc_clock_platform_source(void) { return selected_source; }
+bool rtc_clock_platform_supported(void) { return true; }
+static struct entry { int ns; char key[16]; uint8_t data[832]; size_t size; } entries[40];
+static size_t entry_count;
+int nvs_open(const char *name, int mode, nvs_handle_t *h) {
+    assert(!strcmp(name,"rtc_cal")); (void)mode; ++opens; *h=1; return ESP_OK;
+}
+int nvs_flash_init_partition(const char *part) { assert(!strcmp(part,"rtc_hist")); return ESP_OK; }
+int nvs_open_from_partition(const char *part, const char *name, int mode, nvs_handle_t *h) {
+    assert(!strcmp(part,"rtc_hist")); (void)mode; ++opens;
+    if (!strcmp(name,"hist")) *h=2;
+    else { assert(!strcmp(name,"hist_freq")); *h=3; }
+    return ESP_OK;
+}
+void nvs_close(nvs_handle_t h) { assert(h>=1 && h<=3); }
+int nvs_commit(nvs_handle_t h) { assert(h>=1 && h<=3); return ESP_OK; }
+static struct entry *find_entry(int ns, const char *key) {
+    for(size_t i=0;i<entry_count;++i) if(entries[i].ns==ns && !strcmp(entries[i].key,key)) return &entries[i];
+    return NULL;
+}
+int nvs_get_blob(nvs_handle_t h,const char *key,void *data,size_t *size) {
+    struct entry *e=find_entry(h,key);
+    if(!e) return ESP_ERR_NVS_NOT_FOUND;
+    if(*size<e->size) return ESP_ERR_NVS_INVALID_LENGTH;
+    memcpy(data,e->data,e->size); *size=e->size; return ESP_OK;
+}
+int nvs_set_blob(nvs_handle_t h,const char *key,const void *data,size_t size) {
+    assert(strlen(key)<16 && size<=832); ++writes;
+    struct entry *e=find_entry(h,key);
+    if(!e) { assert(entry_count<40); e=&entries[entry_count++]; e->ns=h; strcpy(e->key,key); }
+    memcpy(e->data,data,size); e->size=size; return ESP_OK;
+}
+'''
+        for name in ["CLOCK_MODEL_RECORD_VERSION", "CLOCK_COEFFICIENT_RECORD_VERSION"]:
+            code += re.search(r"^#define " + name + r"\s+[^\n]+", platform, re.M).group(0) + "\n"
+        for name in ["clock_model_record_t", "clock_coefficient_record_t"]:
+            code += re.search(r"typedef struct\s*\{[^}]+\}\s*" + name + ";", platform, re.S).group(0) + "\n"
+        for name, signature in [
+            ("rtc_clock_checksum", "uint32_t rtc_clock_checksum(const void *data, size_t size)"),
+            ("rtc_clock_platform_load", "rtc_clock_store_result_t rtc_clock_platform_load(rtc_drift_model_t *model)"),
+            ("rtc_clock_platform_save", "bool rtc_clock_platform_save(const rtc_drift_model_t *model)"),
+            ("rtc_clock_platform_load_coefficient", "rtc_clock_store_result_t rtc_clock_platform_load_coefficient(int32_t *ppm)"),
+            ("rtc_clock_platform_save_coefficient", "bool rtc_clock_platform_save_coefficient(int32_t ppm)"),
+            ("history_nvs_read", "static rtc_history_store_result_t history_nvs_read(void *u, const char *key, void *data, size_t *size)"),
+            ("history_nvs_write", "static bool history_nvs_write(void *u, const char *key, const void *data, size_t size)"),
+            ("history_nvs_commit", "static bool history_nvs_commit(void *u)"),
+            ("rtc_history_store_platform_io", "rtc_history_store_result_t rtc_history_store_platform_io(rtc_history_store_io_t *io)"),
+        ]:
+            code += signature + " {\n" + function_body(core if name == "rtc_clock_checksum" else platform, name) + "\n}\n"
+        code += r'''
+int main(void) {
+    rtc_drift_model_t model={.coeff_q19={3.0*RTC_DRIFT_Q19,0,0},.min_temp_mc=10000,
+        .max_temp_mc=21000,.observations=12,.occupied_bins=12,.qualified=true}, out={0};
+    int32_t ppm=0;
+    rtc_history_store_io_t eco_io, frequent_io, disabled_io;
+    rtc_history_t eco_ring, frequent_ring;
+    rtc_history_store_t eco_store, frequent_store;
+    assert(rtc_clock_platform_save_coefficient(1234));
+    assert(rtc_clock_platform_save(&model));
+    assert(find_entry(1,"ppm_fast_v1") && find_entry(1,"model_fast_v1"));
+    assert(rtc_history_store_platform_io(&eco_io)==RTC_HISTORY_STORE_VALID);
+    assert(rtc_history_store_open(&eco_store,&eco_ring,eco_io,2)==RTC_HISTORY_STORE_MISSING);
+    rtc_history_record_t eco_row={.source=2,.sequence=1,.epoch=1,.utc_end_us=UINT64_C(1700000000000000),
+        .raw={RTC_HISTORY_MIN_RAW_US,0},.utc_delta_us=RTC_HISTORY_MIN_RAW_US};
+    assert(rtc_history_store_append(&eco_store,&eco_row,NULL)==RTC_HISTORY_STORE_VALID);
+    selected_mode=RTC_MODE_FREQUENT;
+    assert(rtc_clock_platform_load_coefficient(&ppm)==RTC_CLOCK_STORE_MISSING);
+    assert(rtc_clock_platform_load(&out)==RTC_CLOCK_STORE_MISSING);
+    assert(rtc_history_store_platform_io(&frequent_io)==RTC_HISTORY_STORE_VALID);
+    assert(rtc_history_store_open(&frequent_store,&frequent_ring,frequent_io,2)==RTC_HISTORY_STORE_MISSING);
+    assert(frequent_ring.count==0);
+    assert(rtc_clock_platform_save_coefficient(-5678));
+    model.coeff_q19[0]=4.0*RTC_DRIFT_Q19;
+    assert(rtc_clock_platform_save(&model));
+    rtc_history_record_t frequent_row=eco_row; frequent_row.epoch=99;
+    assert(rtc_history_store_append(&frequent_store,&frequent_row,NULL)==RTC_HISTORY_STORE_VALID);
+    assert(rtc_clock_platform_load_coefficient(&ppm)==RTC_CLOCK_STORE_VALID && ppm==-5678);
+    assert(rtc_clock_platform_load(&out)==RTC_CLOCK_STORE_VALID && out.coeff_q19[0]==4.0*RTC_DRIFT_Q19);
+    /* I/O contexts stay bound to their namespace, even after a new boot selects another mode. */
+    selected_mode=RTC_MODE_ECO;
+    assert(rtc_clock_platform_load_coefficient(&ppm)==RTC_CLOCK_STORE_VALID && ppm==1234);
+    assert(rtc_clock_platform_load(&out)==RTC_CLOCK_STORE_VALID && out.coeff_q19[0]==3.0*RTC_DRIFT_Q19);
+    assert(rtc_history_store_open(&eco_store,&eco_ring,eco_io,2)==RTC_HISTORY_STORE_VALID);
+    assert(rtc_history_store_open(&frequent_store,&frequent_ring,frequent_io,2)==RTC_HISTORY_STORE_VALID);
+    rtc_history_record_t row;
+    assert(eco_ring.count==1 && rtc_history_get(&eco_ring,0,&row) && row.epoch==1);
+    assert(frequent_ring.count==1 && rtc_history_get(&frequent_ring,0,&row) && row.epoch==99);
+    selected_source=0;
+    assert(rtc_clock_platform_load_coefficient(&ppm)==RTC_CLOCK_STORE_MISSING);
+    assert(rtc_clock_platform_load(&out)==RTC_CLOCK_STORE_MISSING);
+    assert(rtc_clock_platform_save_coefficient(22)); assert(rtc_clock_platform_save(&model));
+    assert(find_entry(1,"ppm_slow_v1") && find_entry(1,"model_v1"));
+    selected_mode=RTC_MODE_FREQUENT;
+    assert(rtc_clock_platform_load_coefficient(&ppm)==RTC_CLOCK_STORE_MISSING);
+    assert(rtc_clock_platform_load(&out)==RTC_CLOCK_STORE_MISSING);
+    assert(rtc_clock_platform_save_coefficient(33)); assert(rtc_clock_platform_save(&model));
+    selected_mode=RTC_MODE_ECO;
+    assert(rtc_clock_platform_load_coefficient(&ppm)==RTC_CLOCK_STORE_VALID && ppm==22);
+    unsigned before=opens, written=writes;
+    selected_mode=RTC_MODE_XTAL;
+    assert(rtc_clock_platform_load_coefficient(&ppm)==RTC_CLOCK_STORE_BLOCKED);
+    assert(rtc_clock_platform_load(&out)==RTC_CLOCK_STORE_BLOCKED);
+    assert(!rtc_clock_platform_save_coefficient(17) && !rtc_clock_platform_save(&model));
+    assert(rtc_history_store_platform_io(&disabled_io)==RTC_HISTORY_STORE_BLOCKED);
+    assert(!disabled_io.read && !disabled_io.write && !disabled_io.commit);
+    assert(opens==before && writes==written);
+    puts("RTC actual mode-isolated NVS coefficients, models and history: PASS");
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="rtc-modes-", dir=os.environ.get("COMMANDCODE_SCRATCHPAD")) as directory:
+            path = Path(directory)
+            (path / "test.c").write_text(code)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", "-Imain",
+                            str(path / "test.c"), "main/rtc_drift.c", "main/rtc_history.c", "main/rtc_history_store.c",
+                            "-lm", "-o", str(path / "test")], cwd=ROOT, check=True)
+            subprocess.run([str(path / "test")], check=True)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@
 #include "soc/rtc.h"
 
 /* Keep qualified calibration and write budget over USB/software resets.
- * Every consumer validates version/source/CRC; UTC still requires deep sleep. */
+ * Every consumer validates version/source/mode/CRC; UTC still requires deep sleep. */
 RTC_NOINIT_ATTR rtc_clock_retained_t rtc_clock_retained;
 static temperature_sensor_handle_t s_sensor;
 static bool s_sensor_enabled;
@@ -147,8 +147,10 @@ bool rtc_clock_platform_sensor_stop(void)
 rtc_clock_store_result_t rtc_clock_platform_load(rtc_drift_model_t *model)
 {
     const uint32_t source = rtc_clock_platform_source();
-    const char *key = source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? "model_v1" :
-        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? "model_fast_v1" : NULL;
+    const rtc_mode_t mode = rtc_clock_get_mode();
+    const char *key = !rtc_mode_deep_sleep(mode) ? NULL :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? (mode == RTC_MODE_ECO ? "model_v1" : "freq_model_v1") :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? (mode == RTC_MODE_ECO ? "model_fast_v1" : "freq_mfast_v1") : NULL;
     if (!model || !key || !rtc_clock_platform_supported()) return RTC_CLOCK_STORE_BLOCKED;
     nvs_handle_t handle;
     esp_err_t err = nvs_open("rtc_cal", NVS_READONLY, &handle);
@@ -178,8 +180,10 @@ rtc_clock_store_result_t rtc_clock_platform_load(rtc_drift_model_t *model)
 bool rtc_clock_platform_save(const rtc_drift_model_t *model)
 {
     const uint32_t source = rtc_clock_platform_source();
-    const char *key = source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? "model_v1" :
-        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? "model_fast_v1" : NULL;
+    const rtc_mode_t mode = rtc_clock_get_mode();
+    const char *key = !rtc_mode_deep_sleep(mode) ? NULL :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? (mode == RTC_MODE_ECO ? "model_v1" : "freq_model_v1") :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? (mode == RTC_MODE_ECO ? "model_fast_v1" : "freq_mfast_v1") : NULL;
     if (!key || !rtc_clock_platform_supported() || !rtc_drift_model_validate(model)) return false;
     clock_model_record_t record = {0};
     record.version = CLOCK_MODEL_RECORD_VERSION;
@@ -204,8 +208,10 @@ bool rtc_clock_platform_save(const rtc_drift_model_t *model)
 rtc_clock_store_result_t rtc_clock_platform_load_coefficient(int32_t *ppm)
 {
     const uint32_t source = rtc_clock_platform_source();
-    const char *key = source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? "ppm_slow_v1" :
-        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? "ppm_fast_v1" : NULL;
+    const rtc_mode_t mode = rtc_clock_get_mode();
+    const char *key = !rtc_mode_deep_sleep(mode) ? NULL :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? (mode == RTC_MODE_ECO ? "ppm_slow_v1" : "freq_pslow_v1") :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? (mode == RTC_MODE_ECO ? "ppm_fast_v1" : "freq_pfast_v1") : NULL;
     if (!ppm || !key || !rtc_clock_platform_supported()) return RTC_CLOCK_STORE_BLOCKED;
     nvs_handle_t handle;
     esp_err_t err = nvs_open("rtc_cal", NVS_READONLY, &handle);
@@ -229,8 +235,10 @@ rtc_clock_store_result_t rtc_clock_platform_load_coefficient(int32_t *ppm)
 bool rtc_clock_platform_save_coefficient(int32_t ppm)
 {
     const uint32_t source = rtc_clock_platform_source();
-    const char *key = source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? "ppm_slow_v1" :
-        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? "ppm_fast_v1" : NULL;
+    const rtc_mode_t mode = rtc_clock_get_mode();
+    const char *key = !rtc_mode_deep_sleep(mode) ? NULL :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_SLOW ? (mode == RTC_MODE_ECO ? "ppm_slow_v1" : "freq_pslow_v1") :
+        source == SOC_RTC_SLOW_CLK_SRC_RC_FAST_D256 ? (mode == RTC_MODE_ECO ? "ppm_fast_v1" : "freq_pfast_v1") : NULL;
     if (ppm < -20000 || ppm > 20000 || !key || !rtc_clock_platform_supported()) return false;
     clock_coefficient_record_t record = {0};
     record.version = CLOCK_COEFFICIENT_RECORD_VERSION;
@@ -249,9 +257,10 @@ bool rtc_clock_platform_save_coefficient(int32_t ppm)
 
 static rtc_history_store_result_t history_nvs_read(void *u, const char *key, void *data, size_t *size)
 {
-    (void)u;
+    const char *name = u;
+    if (!name) return RTC_HISTORY_STORE_BLOCKED;
     nvs_handle_t handle;
-    esp_err_t err = nvs_open_from_partition("rtc_hist", "hist", NVS_READONLY, &handle);
+    esp_err_t err = nvs_open_from_partition("rtc_hist", name, NVS_READONLY, &handle);
     if (err == ESP_ERR_NVS_NOT_FOUND) return RTC_HISTORY_STORE_MISSING;
     if (err != ESP_OK) return RTC_HISTORY_STORE_IO_ERROR;
     err = nvs_get_blob(handle, key, data, size);
@@ -263,9 +272,10 @@ static rtc_history_store_result_t history_nvs_read(void *u, const char *key, voi
 
 static bool history_nvs_write(void *u, const char *key, const void *data, size_t size)
 {
-    (void)u;
+    const char *name = u;
+    if (!name) return false;
     nvs_handle_t handle;
-    if (nvs_open_from_partition("rtc_hist", "hist", NVS_READWRITE, &handle) != ESP_OK) return false;
+    if (nvs_open_from_partition("rtc_hist", name, NVS_READWRITE, &handle) != ESP_OK) return false;
     esp_err_t err = nvs_set_blob(handle, key, data, size);
     if (err == ESP_OK) err = nvs_commit(handle);
     nvs_close(handle);
@@ -282,15 +292,18 @@ rtc_history_store_result_t rtc_history_store_platform_io(rtc_history_store_io_t 
 {
     if (!io) return RTC_HISTORY_STORE_BLOCKED;
     memset(io, 0, sizeof *io);
+    const rtc_mode_t mode = rtc_clock_get_mode();
+    if (!rtc_mode_deep_sleep(mode)) return RTC_HISTORY_STORE_BLOCKED;
+    const char *name = mode == RTC_MODE_ECO ? "hist" : "hist_freq";
     esp_err_t err = nvs_flash_init_partition("rtc_hist");
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
         return RTC_HISTORY_STORE_BLOCKED;
     if (err != ESP_OK) return RTC_HISTORY_STORE_IO_ERROR;
     nvs_handle_t handle;
-    err = nvs_open_from_partition("rtc_hist", "hist", NVS_READWRITE, &handle);
+    err = nvs_open_from_partition("rtc_hist", name, NVS_READWRITE, &handle);
     if (err != ESP_OK) return RTC_HISTORY_STORE_IO_ERROR;
     nvs_close(handle);
-    *io = (rtc_history_store_io_t){NULL, history_nvs_read, history_nvs_write, history_nvs_commit};
+    *io = (rtc_history_store_io_t){(void *)name, history_nvs_read, history_nvs_write, history_nvs_commit};
     return RTC_HISTORY_STORE_VALID;
 }
 

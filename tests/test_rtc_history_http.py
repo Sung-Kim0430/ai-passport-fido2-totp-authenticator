@@ -35,6 +35,8 @@ typedef struct { const char *query; } httpd_req_t;
 #define pdMS_TO_TICKS(ms) (ms)
 static int locks, s_snapshot_lock, code, calls, mode;
 static bool in_owner, real_pages, metadata_wide;
+static rtc_mode_t clock_mode;
+rtc_mode_t rtc_clock_get_mode(void) { return clock_mode; }
 static rtc_history_t history;
 static void lifecycle_during_owner(void);
 static struct { bool unlocked; struct { uint32_t learning_reason; } clock; } s_snapshot = {true,{13}};
@@ -73,7 +75,10 @@ static void dispatch(const char *q,int expected) { httpd_req_t r={q};used=0;code
 int main(void) {
  history_mailbox_reset(true);
  token=NULL;dispatch("",403);assert(!calls);token="bad";dispatch("",403);token="1123456789ABCDEF0123456789ABCDEF";dispatch("",403);token=s_session;
+ clock_mode=RTC_MODE_XTAL;
  s_snapshot.unlocked=false;dispatch("",423);assert(!calls);s_snapshot.unlocked=true;
+ dispatch("",422);assert(strstr(output,"RTC_HISTORY_NOT_APPLICABLE") && !calls);
+ clock_mode=RTC_MODE_ECO;
  const char *bad[]={"cursor=1","cursor=-1","cursor=101","cursor=1.0","cursor=18446744073709551616","generation=18446744073709551616","generation=","cursor=","x=1","cursor=0&cursor=0","generation=1&generation=1","cursor=0&","cursor=%30","cursor=0&&generation=1"};
  for(size_t i=0;i<sizeof bad/sizeof bad[0];i++)dispatch(bad[i],400);
  char huge[100];memset(huge,'1',sizeof huge-1);huge[sizeof huge-1]=0;dispatch(huge,400);

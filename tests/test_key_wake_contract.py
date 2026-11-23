@@ -91,7 +91,7 @@ class KeyWakeGuardWiringTest(unittest.TestCase):
         self.assertIn("CONFIG_BUTTON_PERIOD_TIME_MS", self.bsp)
         self.assertIn("CONFIG_BUTTON_DEBOUNCE_TICKS", self.bsp)
 
-    def test_actual_on_key_discards_every_idle_and_accepts_next_gesture(self) -> None:
+    def test_actual_on_key_separates_idle_from_keys_and_accepts_next_gesture(self) -> None:
         # 提取真实函数体编译；只替代 SDK 队列与时钟，不复制被测接线逻辑。
         harness = r'''
 #include <assert.h>
@@ -103,16 +103,19 @@ typedef struct {
     int type;
     struct { struct { bsp_btn_t btn; bsp_btn_ev_t ev; uint64_t when_ms; } key; } data;
 } app_event_t;
-enum { EVT_KEY };
+enum { EVT_KEY, EVT_KEY_IDLE };
 static key_guard_t s_key_guard;
 static bool s_input_ready;
 static void *s_evt_queue;
 static int queued;
+static int idle_queued;
 static int64_t clock_us;
 #define ESP_LOGI(...) ((void)0)
 static int64_t esp_timer_get_time(void) { return clock_us; }
 static int xQueueSend(void *queue, const app_event_t *event, int wait) {
-    assert(queue && wait == 0 && event->type == EVT_KEY);
+    assert(queue && wait == 0);
+    if (event->type == EVT_KEY_IDLE) { ++idle_queued; return 1; }
+    assert(event->type == EVT_KEY);
     assert(event->data.key.ev != BSP_BTN_IDLE);
     ++queued;
     return 1;
@@ -140,6 +143,7 @@ int main(void) {
     on_key(BSP_BTN_OK, BSP_BTN_IDLE, 0);
     on_key(BSP_BTN_UP, BSP_BTN_IDLE, 0);
     assert(queued == 0);
+    assert(idle_queued == 2);
     on_key(BSP_BTN_DOWN, BSP_BTN_PRESS, 0);
     on_key(BSP_BTN_DOWN, BSP_BTN_RELEASE, 0);
     on_key(BSP_BTN_DOWN, BSP_BTN_CLICK, 0);

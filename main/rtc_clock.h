@@ -3,7 +3,13 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "rtc_mode.h"
 #include "rtc_history_store.h"
+
+/* Application owner: configure after NVS selection, before any initialization.
+ * Invalid modes and all calls after initialization leave the mode unchanged. */
+bool rtc_clock_configure_mode(rtc_mode_t mode);
+rtc_mode_t rtc_clock_get_mode(void);
 
 typedef enum {
     RTC_CLOCK_CALIBRATION_NONE = 0,

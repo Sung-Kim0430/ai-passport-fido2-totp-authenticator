@@ -5,7 +5,8 @@
 
 static void test_settings_window(void)
 {
-    const uint8_t starts[] = {0, 3, 6, 9, 10, 13, 14, 15};
+    const uint8_t starts[] = {0, 3, 6, 9, 10, 13, 15, 16};
+    assert(AUTH_SETTINGS_ITEM_COUNT == 16);
     for (uint8_t selected = 0; selected < AUTH_SETTINGS_ITEM_COUNT; selected++) {
         auth_settings_window_t window = auth_ui_settings_window(selected);
         assert(window.group < 7);
@@ -14,11 +15,47 @@ static void test_settings_window(void)
         assert(window.count <= 3);
         assert(selected >= window.first && selected < window.first + window.count);
     }
+    auth_settings_window_t invalid = auth_ui_settings_window(UINT8_MAX);
+    assert(invalid.first == 15 && invalid.count == 1 && invalid.group == 6);
+}
+
+static void test_clock_modes_navigation(void)
+{
+    assert(AUTH_SETTINGS_CLOCK_MODES_INDEX == 14 && AUTH_SETTINGS_EXIT_INDEX == 15);
+    assert(AUTH_CLOCK_MODES_BACK_INDEX == 3 && AUTH_CLOCK_MODES_ITEM_COUNT == 4);
+    assert(AUTH_CLOCK_MODES_PAGE_LIST == 0 && AUTH_CLOCK_MODES_PAGE_BEHAVIOR == 1);
+    assert(AUTH_CLOCK_MODES_PAGE_STANDBY == 2 && AUTH_CLOCK_MODES_PAGE_ACCURACY == 3);
+    assert(AUTH_CLOCK_MODES_PAGE_APPLY == 4);
+    for (uint8_t selected = 0; selected < AUTH_CLOCK_MODES_ITEM_COUNT; selected++) {
+        uint8_t next = auth_ui_clock_modes_next_selection(selected, true);
+        assert(next < AUTH_CLOCK_MODES_ITEM_COUNT);
+        assert(auth_ui_clock_modes_next_selection(next, false) == selected);
+    }
+    assert(auth_ui_clock_modes_next_selection(AUTH_CLOCK_MODES_BACK_INDEX, true) == 0);
+    assert(auth_ui_clock_modes_next_selection(0, false) == AUTH_CLOCK_MODES_BACK_INDEX);
+    assert(auth_ui_clock_modes_next_selection(UINT8_MAX, true) == 0);
+    assert(auth_ui_clock_modes_next_selection(UINT8_MAX, false) == 0);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_LIST, false) == 0);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_LIST, true) == 0);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_BEHAVIOR, false) == 4);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_BEHAVIOR, true) == 2);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_STANDBY, false) == 1);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_STANDBY, true) == 3);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_APPLY, false) == 3);
+    assert(auth_ui_clock_modes_next_page(AUTH_CLOCK_MODES_PAGE_APPLY, true) == 1);
+    assert(auth_ui_clock_modes_next_page(UINT8_MAX, false) == 4);
+    assert(auth_ui_clock_modes_next_page(UINT8_MAX, true) == 4);
+    for (uint8_t page = AUTH_CLOCK_MODES_PAGE_BEHAVIOR; page <= AUTH_CLOCK_MODES_PAGE_APPLY; page++) {
+        uint8_t next = auth_ui_clock_modes_next_page(page, true);
+        assert(next >= AUTH_CLOCK_MODES_PAGE_BEHAVIOR && next <= AUTH_CLOCK_MODES_PAGE_APPLY);
+        assert(auth_ui_clock_modes_next_page(next, false) == page);
+    }
 }
 
 int main(void)
 {
     test_settings_window();
+    test_clock_modes_navigation();
     char text[16];
     auth_ui_format_battery(text, sizeof(text), 100, false, false);
     assert(strcmp(text, "100%") == 0);
@@ -114,6 +151,6 @@ int main(void)
             assert(covered == total);
         }
     }
-    puts("Battery, clock, card stepping and direct list paging: PASS");
+    puts("Battery, clock modes, settings groups, card stepping and direct list paging: PASS");
     return 0;
 }

@@ -4,8 +4,10 @@
 #include <string.h>
 #include "rtc_clock_internal.h"
 #include "rtc_light_sleep.h"
+#include "rtc_trace.h"
 
 rtc_clock_retained_t rtc_clock_retained;
+rtc_trace_store_t rtc_trace_store;
 static uint64_t ticks, rtc_us;
 static int64_t uptime_step_us;
 static int64_t uptime_us, wall_us, applied_us;
@@ -13,14 +15,19 @@ static uint32_t period;
 static int32_t temperature;
 static bool fail_set, fail_get, fail_sensor, fail_stop, fail_save;
 static unsigned sets, saves, stops, reads, measures;
-static rtc_clock_store_result_t store_state;
-static rtc_drift_model_t stored_model;
+static rtc_clock_store_result_t model_stores[RTC_MODE_COUNT];
+static rtc_drift_model_t stored_models[RTC_MODE_COUNT];
+#define store_state model_stores[rtc_clock_get_mode()]
+#define stored_model stored_models[rtc_clock_get_mode()]
 static int64_t tick_delay_before_us, tick_delay_after_us, set_delay_us;
 static int64_t wall_delay_before_us, wall_delay_after_us;
 static unsigned delayed_tick_reads;
 static uint32_t source;
-static int32_t stored_ppm;
-static rtc_clock_store_result_t coefficient_store;
+static int32_t stored_ppms[RTC_MODE_COUNT];
+static rtc_clock_store_result_t coefficient_stores[RTC_MODE_COUNT];
+static unsigned coefficient_loads, model_loads;
+#define stored_ppm stored_ppms[rtc_clock_get_mode()]
+#define coefficient_store coefficient_stores[rtc_clock_get_mode()]
 static unsigned coefficient_saves;
 static bool fail_coefficient_save;
 static bool change_source_on_tick;
@@ -42,6 +49,7 @@ rtc_light_sleep_snapshot_t rtc_light_sleep_platform_snapshot(void) {
 
 uint32_t rtc_clock_platform_source(void) { return source; }
 rtc_clock_store_result_t rtc_clock_platform_load_coefficient(int32_t *out) {
+    ++coefficient_loads;
     *out = stored_ppm;
     return coefficient_store;
 }
@@ -93,6 +101,7 @@ bool rtc_clock_platform_sensor_stop(void) { ++stops; return !fail_stop; }
 uint32_t rtc_clock_platform_measure(void) { ++measures; return period; }
 bool rtc_clock_platform_supported(void) { return true; }
 rtc_clock_store_result_t rtc_clock_platform_load(rtc_drift_model_t *out) {
+    ++model_loads;
     if (store_state == RTC_CLOCK_STORE_VALID) *out = stored_model;
     return store_state;
 }
@@ -113,8 +122,10 @@ bool rtc_clock_platform_arm_interval(uint64_t interval_us) {
     return interval_us > 0;
 }
 
-static uint8_t history_blobs[13][832];
-static size_t history_sizes[13];
+static uint8_t mode_history_blobs[RTC_MODE_COUNT][13][832];
+static size_t mode_history_sizes[RTC_MODE_COUNT][13];
+#define history_blobs mode_history_blobs[rtc_clock_get_mode()]
+#define history_sizes mode_history_sizes[rtc_clock_get_mode()]
 static unsigned history_reads, history_writes, history_commits, epoch_calls;
 static bool history_fail, history_ack_loss, history_init_fail;
 static unsigned history_init_calls;
@@ -164,8 +175,9 @@ static void reboot_runtime(void) { free(s_clock.history); memset(&s_clock, 0, si
 static void reset_all(void) {
     reboot_runtime();
     memset(&rtc_clock_retained, 0, sizeof rtc_clock_retained);
-    memset(history_blobs, 0, sizeof history_blobs);
-    memset(history_sizes, 0, sizeof history_sizes);
+    memset(&rtc_trace_store, 0, sizeof rtc_trace_store);
+    memset(mode_history_blobs, 0, sizeof mode_history_blobs);
+    memset(mode_history_sizes, 0, sizeof mode_history_sizes);
     history_reads = history_writes = history_commits = epoch_calls = 0;
     history_fail = history_ack_loss = history_init_fail = false;
     history_init_calls = 0;
@@ -176,8 +188,11 @@ static void reset_all(void) {
     sets = saves = stops = reads = measures = delayed_tick_reads = 0;
     tick_delay_before_us = tick_delay_after_us = set_delay_us = 0;
     wall_delay_before_us = wall_delay_after_us = 0;
-    store_state = RTC_CLOCK_STORE_MISSING;
-    coefficient_store = RTC_CLOCK_STORE_MISSING;
+    memset(model_stores, 0, sizeof model_stores);
+    memset(coefficient_stores, 0, sizeof coefficient_stores);
+    memset(stored_ppms, 0, sizeof stored_ppms);
+    memset(stored_models, 0, sizeof stored_models);
+    coefficient_loads = model_loads = 0;
     coefficient_saves = source = 0;
     stored_ppm = 0;
     fail_coefficient_save = change_source_on_tick = false;
@@ -1754,7 +1769,265 @@ static void check_maintenance_saves_due_coefficient(void) {
     assert(coefficient_saves == 1);
 }
 
+static void check_trace_reconstructs_sleep_and_reference_error(void) {
+    reset_all();
+    coefficient_store = RTC_CLOCK_STORE_VALID; stored_ppm = -870;
+    rtc_clock_boot(false, true);
+    assert(rtc_trace_store.sequence == 1);
+    assert(rtc_clock_start_light_sleep());
+    simulate_light_sleep(300000);
+    assert(rtc_clock_service_light_sleep());
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    const uint64_t first_start = ticks;
+    uint64_t expected_raw = 300000;
+    for (unsigned i = 0; i < 36; ++i) {
+        const uint64_t start = ticks;
+        rtc_trace_store.wake_tick = start + 300000000;
+        rtc_trace_store.wake_tick_inverse = ~rtc_trace_store.wake_tick;
+        ticks += 304000000; // 900 seconds asleep plus 12 seconds of boot.
+        expected_raw += UINT64_C(912000000);
+        uptime_us = 12000000;
+        reboot_runtime();
+        memset(&light_snapshot, 0, sizeof light_snapshot);
+        assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+        rtc_trace_record_t *row = &rtc_trace_store.records[(rtc_trace_store.sequence - 1) % RTC_TRACE_CAPACITY];
+        assert(rtc_trace_record_valid(row) && row->kind == RTC_TRACE_SLEEP);
+        assert(row->start_tick == start && row->end_tick == ticks);
+        assert(row->wake_tick == start + 300000000 && row->ppm == -870);
+        assert(row->raw_us == expected_raw);
+        assert(row->wall_after_us == wall_us && row->hrt_us == uptime_us);
+        assert(row->light_raw_us == (i == 0 ? 300000 : 0));
+        assert(row->awake_us == 0);
+        if (i != 35) assert(rtc_clock_prepare_maintenance() && rtc_clock_commit_sleep(true));
+    }
+    assert(rtc_trace_store.records[1].start_tick == first_start);
+    rtc_clock_reference_t reference = reference_now(101, (uint64_t)wall_us + UINT64_C(420000000));
+    assert(rtc_clock_apply_reference(&reference) == RTC_CLOCK_REFERENCE_SET);
+    rtc_trace_record_t *row = &rtc_trace_store.records[(rtc_trace_store.sequence - 1) % RTC_TRACE_CAPACITY];
+    assert(row->kind == RTC_TRACE_REFERENCE && rtc_trace_record_valid(row));
+    assert(row->wall_after_us - row->wall_before_us == INT64_C(420000000));
+    assert(row->raw_us == expected_raw);
+    const uint32_t sequence = rtc_trace_store.sequence;
+    reboot_runtime();
+    assert(rtc_clock_boot(false, false) == RTC_CLOCK_BASELINE);
+    assert(rtc_trace_store.sequence == sequence + 1);
+    assert(rtc_trace_store.records[(rtc_trace_store.sequence - 1) % RTC_TRACE_CAPACITY].kind == RTC_TRACE_RESET);
+}
+
+static void check_trace_keeps_abandoned_restore_and_awake_endpoints(void) {
+    reset_all();
+    prepare_session();
+    ticks += 100000;
+    reboot_runtime(); uptime_us = 12000000;
+    assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+    const int64_t boot_hrt = uptime_us;
+    assert(rtc_clock_start_light_sleep());
+    advance_fake(7000000);
+    simulate_light_sleep(300000);
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    const int64_t commit_hrt = uptime_us;
+    ticks += 100000;
+    reboot_runtime(); uptime_us = 12000000;
+    memset(&light_snapshot, 0, sizeof light_snapshot);
+    assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+    rtc_trace_record_t *row = &rtc_trace_store.records[(rtc_trace_store.sequence - 1) % RTC_TRACE_CAPACITY];
+    assert(row->commit_hrt_us == commit_hrt);
+    assert(row->commit_hrt_us - boot_hrt - (int64_t)row->light_sdk_us == 7000000);
+    assert(row->awake_us == 7000000);
+    assert(rtc_clock_prepare_maintenance() && rtc_clock_commit_sleep(true));
+    const uint64_t pending_tick = ticks;
+    ticks += 100000;
+    reboot_runtime(); uptime_us = 12000000;
+    fail_set = true;
+    assert(rtc_clock_boot(true, true) == RTC_CLOCK_NEEDS_SYNC);
+    fail_set = false;
+    const uint32_t sequence = rtc_trace_store.sequence;
+    rtc_clock_reference_t ref = reference_now(101, (uint64_t)wall_us);
+    assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+    assert(rtc_trace_store.sequence == sequence + 2);
+    row = &rtc_trace_store.records[sequence % RTC_TRACE_CAPACITY];
+    assert(row->kind == RTC_TRACE_GAP && row->start_tick == pending_tick);
+    assert(row->end_tick == UINT64_MAX && row->wall_after_us == -1);
+}
+
+static void check_mode_policy_and_configuration(void) {
+    reset_all();
+    assert(RTC_MODE_ECO == 0 && RTC_MODE_FREQUENT == 1 && RTC_MODE_XTAL == 2 && RTC_MODE_COUNT == 3);
+    assert(rtc_clock_get_mode() == RTC_MODE_ECO);
+    for (int value = -1; value <= RTC_MODE_COUNT; ++value) {
+        const rtc_mode_t mode = (rtc_mode_t)value;
+        const bool valid = value >= RTC_MODE_ECO && value < RTC_MODE_COUNT;
+        const bool sleep = value == RTC_MODE_ECO || value == RTC_MODE_FREQUENT;
+        assert(rtc_mode_valid(mode) == valid);
+        assert(rtc_mode_deep_sleep(mode) == sleep && rtc_mode_light_sleep(mode) == sleep);
+        assert(rtc_mode_interval_us(mode, true) == (sleep ? UINT64_C(120000000) : 0));
+        const uint64_t steady = value == RTC_MODE_ECO ? UINT64_C(900000000) :
+            value == RTC_MODE_FREQUENT ? UINT64_C(180000000) : 0;
+        assert(rtc_mode_interval_us(mode, false) == steady);
+        assert(rtc_clock_configure_mode(mode) == valid);
+    }
+    assert(rtc_clock_get_mode() == RTC_MODE_XTAL);
+    assert(rtc_clock_configure_mode(RTC_MODE_FREQUENT));
+    assert(rtc_clock_boot(false, false) == RTC_CLOCK_BASELINE);
+    assert(!rtc_clock_configure_mode(RTC_MODE_ECO));
+    assert(!rtc_clock_configure_mode(RTC_MODE_FREQUENT));
+    assert(rtc_clock_get_mode() == RTC_MODE_FREQUENT);
+    reboot_runtime();
+    assert(rtc_clock_get_mode() == RTC_MODE_ECO);
+}
+
+static void check_mode_retention_and_sessions(void) {
+    for (rtc_mode_t before = RTC_MODE_ECO; before <= RTC_MODE_FREQUENT; ++before) {
+        for (rtc_mode_t after = RTC_MODE_ECO; after < RTC_MODE_COUNT; ++after) {
+            for (unsigned deep = 0; deep < 2; ++deep) {
+                reset_all();
+                assert(rtc_clock_configure_mode(before));
+                stored_ppm = 1234;
+                coefficient_store = RTC_CLOCK_STORE_VALID;
+                prepare_session();
+                /* Keep an unsaved qualified coefficient and model in RTC RAM. */
+                rtc_clock_retained.accounting.active_ppm = 4321;
+                seal_accounting();
+                rtc_clock_retained.model = (rtc_drift_model_t){
+                    .coeff_q19 = {3.0 * RTC_DRIFT_Q19, 0, 0}, .min_temp_mc = 10000,
+                    .max_temp_mc = 21000, .observations = 12, .occupied_bins = 12, .qualified = true
+                };
+                assert(rtc_drift_model_validate(&rtc_clock_retained.model));
+                ticks += 1000000;
+                reboot_runtime();
+                assert(rtc_clock_configure_mode(after));
+                rtc_clock_boot_result_t result = rtc_clock_boot(deep, true);
+                assert(result == (!deep ? RTC_CLOCK_BASELINE :
+                    before == after ? RTC_CLOCK_RESTORED : RTC_CLOCK_NEEDS_SYNC));
+                assert(rtc_clock_diagnostics().ppm_qualified == (before == after));
+                assert(rtc_clock_diagnostics().ppm == (before == after ? 4321 : 0));
+                if (before != after) {
+                    assert(!rtc_clock_retained.accounting.learning.baseline_valid);
+                    assert(!rtc_clock_retained.accounting.learning.qualified);
+                    assert(!rtc_drift_model_validate(&rtc_clock_retained.model));
+                    assert(!rtc_clock_maintenance_due(true));
+                }
+            }
+        }
+    }
+    reset_all(); prepare_session();
+    rtc_clock_retained.session.mode = RTC_MODE_FREQUENT;
+    rtc_clock_session_seal(&rtc_clock_retained.session);
+    ticks += 1000000; reboot_runtime();
+    assert(rtc_clock_boot(true, true) == RTC_CLOCK_NEEDS_SYNC);
+    reset_all(); prepare_session();
+    rtc_clock_retained.session.mode = RTC_MODE_COUNT;
+    rtc_clock_session_seal(&rtc_clock_retained.session);
+    assert(!rtc_clock_session_valid(&rtc_clock_retained.session));
+    rtc_clock_retained.accounting.mode = RTC_MODE_COUNT;
+    seal_accounting();
+    assert(!accounting_valid());
+    reset_all(); prepare_session();
+    rtc_clock_retained.accounting.version = RTC_CLOCK_VERSION - 1;
+    rtc_clock_retained.session.version = RTC_CLOCK_VERSION - 1;
+    seal_accounting();
+    rtc_clock_session_seal(&rtc_clock_retained.session);
+    ticks += 1000000; reboot_runtime();
+    assert(rtc_clock_boot(true, true) == RTC_CLOCK_NEEDS_SYNC);
+}
+
+static void check_mode_history_and_xtal(void) {
+    history_test_start();
+    history_test_window();
+    rtc_clock_tick();
+    assert(rtc_clock_history_owner_summary().durable_count == 1);
+    history_test_window();
+    assert(rtc_clock_history_owner_summary().pending_count == 1);
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    for (rtc_mode_t mode = RTC_MODE_FREQUENT; mode <= RTC_MODE_XTAL; ++mode) {
+        reboot_runtime();
+        assert(rtc_clock_configure_mode(mode));
+        unsigned loads = coefficient_loads + model_loads;
+        rtc_clock_boot(false, false);
+        unsigned writes = history_writes;
+        unsigned init_calls = history_init_calls;
+        rtc_clock_begin_normal_wake();
+        rtc_clock_tick();
+        rtc_clock_history_summary_t summary = rtc_clock_history_owner_summary();
+        assert(summary.pending_count == 0 && summary.durable_count == 0);
+        assert(summary.accepted_sequence == 0 && summary.durable_sequence == 0);
+        assert(!summary.active_qualified && !summary.legacy_candidate_qualified);
+        assert(!summary.saved_ppm_valid && !summary.coefficient_saved);
+        assert(summary.store_status == RTC_HISTORY_STORE_MISSING);
+        assert(summary.ready == (mode == RTC_MODE_FREQUENT));
+        assert(history_writes == writes);
+        if (mode == RTC_MODE_XTAL) {
+            assert(loads == coefficient_loads + model_loads);
+            assert(history_init_calls == init_calls);
+            unsigned measured = measures;
+            assert(!rtc_clock_start_light_sleep());
+            assert(!rtc_clock_prepare_sleep() && !rtc_clock_commit_sleep(true));
+            assert(!rtc_clock_maintenance_due(true) && !rtc_clock_prepare_maintenance());
+            for (unsigned i = 0; i < 20; ++i) {
+                advance_fake(INT64_C(3600000000));
+                rtc_clock_reference_t ref = reference_now(i + 1, (uint64_t)wall_us);
+                assert(rtc_clock_apply_reference(&ref) == RTC_CLOCK_REFERENCE_SET);
+                rtc_clock_tick();
+            }
+            summary = rtc_clock_history_owner_summary();
+            assert(!summary.active_qualified && !summary.legacy_candidate_qualified);
+            assert(summary.pending_count == 0 && summary.accepted_sequence == 0);
+            assert(!rtc_clock_retained.accounting.learning.baseline_valid);
+            assert(measures == measured && history_writes == writes);
+            assert(!saves && !coefficient_saves);
+        }
+    }
+    reboot_runtime();
+    assert(rtc_clock_configure_mode(RTC_MODE_ECO));
+    rtc_clock_boot(false, false);
+    rtc_clock_begin_normal_wake();
+    rtc_clock_history_summary_t summary = rtc_clock_history_owner_summary();
+    assert(summary.ready && summary.durable_count == 1 && summary.pending_count == 0);
+    assert(summary.active_ppm == -870 && summary.saved_ppm_valid);
+    rtc_history_page_t page;
+    assert(rtc_clock_history_owner_page(summary.generation, 0, &page));
+    assert(page.count == 1 && page.rows[0].sequence == 1);
+
+    history_test_start();
+    history_test_window();
+    assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+    rtc_clock_retained.history.mode = RTC_MODE_FREQUENT;
+    history_seal();
+    ticks += 1000000; reboot_runtime();
+    assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+    rtc_clock_begin_normal_wake();
+    summary = rtc_clock_history_owner_summary();
+    assert(summary.pending_count == 0 && summary.accepted_sequence == 0);
+}
+
+static void check_mode_commit_intervals(void) {
+    for (rtc_mode_t mode = RTC_MODE_ECO; mode <= RTC_MODE_FREQUENT; ++mode) {
+        reset_all();
+        assert(rtc_clock_configure_mode(mode));
+        prepare_session();
+        assert(armed_interval_us == UINT64_C(120000000));
+        for (unsigned i = 0; i < 3; ++i) {
+            ticks += armed_interval_us / 3;
+            reboot_runtime();
+            assert(rtc_clock_configure_mode(mode));
+            assert(rtc_clock_boot(true, true) == RTC_CLOCK_RESTORED);
+            assert(rtc_clock_prepare_maintenance() && rtc_clock_commit_sleep(true));
+            assert(armed_interval_us == (mode == RTC_MODE_ECO ? UINT64_C(900000000) : UINT64_C(180000000)));
+        }
+        assert(rtc_clock_abort_sleep());
+        rtc_clock_begin_normal_wake();
+        assert(rtc_clock_prepare_sleep() && rtc_clock_commit_sleep(true));
+        assert(armed_interval_us == UINT64_C(120000000));
+    }
+}
+
 int main(int argc, char **argv) {
+    check_mode_policy_and_configuration();
+    check_mode_retention_and_sessions();
+    check_mode_history_and_xtal();
+    check_mode_commit_intervals();
+    check_trace_reconstructs_sleep_and_reference_error();
+    check_trace_keeps_abandoned_restore_and_awake_endpoints();
     check_maintenance_reason_survives_sync_and_restart();
     check_restart_keeps_rate_and_budget_without_utc();
     check_maintenance_saves_due_coefficient();

@@ -1,5 +1,6 @@
 #include "rtc_clock_internal.h"
 #include "rtc_light_sleep.h"
+#include "rtc_trace.h"
 
 #include <limits.h>
 #include <math.h>
@@ -24,6 +25,7 @@ _Static_assert(sizeof(clock_history_cache_t) + sizeof(rtc_clock_history_summary_
 
 /* 普通任务单一所有；硬件 I/O 独立，以便运行同一状态机的主机回归。 */
 static struct {
+    rtc_mode_t mode;
     clock_history_cache_t *history;
     bool history_started;
     bool history_retained_valid;
@@ -70,6 +72,18 @@ static struct {
     rtc_light_sleep_snapshot_t light_seen;
 } s_clock;
 
+bool rtc_clock_configure_mode(rtc_mode_t mode)
+{
+    if (s_clock.initialized || !rtc_mode_valid(mode)) return false;
+    s_clock.mode = mode;
+    return true;
+}
+
+rtc_mode_t rtc_clock_get_mode(void)
+{
+    return s_clock.mode;
+}
+
 /* 位运算校验不依赖查表、日志或 libc；stub 也要在最终 ELF 中验证其放置。 */
 uint32_t CLOCK_RTC_ATTR rtc_clock_checksum(const void *data, size_t size)
 {
@@ -95,6 +109,7 @@ bool CLOCK_RTC_ATTR rtc_clock_session_valid(const rtc_clock_session_t *session)
     rtc_drift_ledger_t ledger = session->ledger;
     if (ledger.phase == RTC_DRIFT_LEDGER_CONSUMED) ledger.phase = RTC_DRIFT_LEDGER_ACTIVE;
     return session->magic == RTC_CLOCK_MAGIC && session->version == RTC_CLOCK_VERSION &&
+           session->mode <= RTC_MODE_FREQUENT &&
            session->utc_trusted <= 1 && session->user_wake <= 1 && session->maintenance_enabled <= 1 &&
            (session->source == 0 || session->source == 2) && session->continuity &&
            session->ppm >= -20000 && session->ppm <= 20000 &&
@@ -112,7 +127,8 @@ static bool history_retained_valid(void)
 {
     const rtc_clock_history_retained_t *h = &rtc_clock_retained.history;
     if (h->checksum != rtc_clock_checksum(h, offsetof(rtc_clock_history_retained_t, checksum))) return false;
-    if (h->version != 1 || !h->epoch || h->count > 2 || (h->flags & ~7u) ||
+    if (h->version != 2 || h->mode != (uint32_t)s_clock.mode ||
+        !h->epoch || h->count > 2 || (h->flags & ~7u) ||
         h->budget_us > RTC_CLOCK_HISTORY_INTERVAL_US || h->durable_sequence > h->accepted_sequence ||
         h->dropped > h->accepted_sequence) return false;
     uint64_t previous = h->durable_sequence;
@@ -194,6 +210,7 @@ static void seal_accounting(void);
 
 static void history_refresh(void)
 {
+    if (!rtc_mode_deep_sleep(s_clock.mode)) return;
     rtc_history_estimate_t estimate = {0};
     int64_t now;
     if (s_clock.history && (s_clock.history_status == RTC_HISTORY_STORE_VALID ||
@@ -277,14 +294,16 @@ static void reset_learning(void);
 
 static void history_start(void)
 {
-    if (s_clock.history_started || !s_clock.initialized || s_clock.maintenance) return;
+    if (s_clock.history_started || !s_clock.initialized || s_clock.maintenance ||
+        !rtc_mode_deep_sleep(s_clock.mode)) return;
     s_clock.history_started = true;
     rtc_clock_history_retained_t *h = &rtc_clock_retained.history;
     const bool fresh = !s_clock.history_retained_valid;
     if (fresh) {
         if (s_clock.continuity_valid) reset_learning();
         memset(h, 0, sizeof *h);
-        h->version = 1;
+        h->version = 2;
+        h->mode = (uint32_t)s_clock.mode;
         h->flags = 5;
         h->epoch = rtc_clock_platform_history_epoch();
         if (!h->epoch) h->epoch = 1;
@@ -327,6 +346,9 @@ static void history_checkpoint(void)
 
 rtc_clock_history_summary_t rtc_clock_history_owner_summary(void)
 {
+    if (!rtc_mode_deep_sleep(s_clock.mode)) return (rtc_clock_history_summary_t){
+        .store_status = RTC_HISTORY_STORE_MISSING, .save_result = RTC_HISTORY_STORE_MISSING
+    };
     const rtc_clock_history_retained_t *h = &rtc_clock_retained.history;
     const rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
     const bool ready = s_clock.history && !s_clock.history_busy &&
@@ -391,7 +413,9 @@ static bool accounting_valid(void)
             (calibration->quality == RTC_CLOCK_CALIBRATION_NONE && calibration->evidence_sequence)) return false;
     } else if (calibration->estimator_version != RTC_HISTORY_ESTIMATE_VERSION ||
         !calibration->uncertainty_valid || !calibration->evidence_sequence) return false;
-    return a->version == RTC_CLOCK_VERSION && a->source == s_clock.source && a->continuity &&
+    return a->version == RTC_CLOCK_VERSION && a->source == s_clock.source &&
+        a->mode == (uint32_t)s_clock.mode && rtc_mode_valid(s_clock.mode) && a->continuity &&
+        (s_clock.mode != RTC_MODE_XTAL || (!a->active_qualified && !a->learning.qualified)) &&
         rtc_drift_time_valid(&a->raw_total) && rtc_drift_time_valid(&a->corrected_total) &&
         a->awake_total_us <= RTC_DRIFT_MAX_ELAPSED_US && a->utc_phase_q19 < RTC_DRIFT_Q19 &&
         a->coefficient_budget_us <= RTC_CLOCK_SAVE_INTERVAL_US &&
@@ -414,6 +438,21 @@ static void reset_learning(void)
     a->learning_reason = RTC_DRIFT_LEARN_CONTINUITY;
 }
 
+static rtc_trace_record_t trace_snapshot(uint32_t kind, int64_t hrt)
+{
+    const rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
+    return (rtc_trace_record_t){
+        .kind = kind, .wake_tick = UINT64_MAX, .hrt_us = hrt,
+        .raw_us = a->raw_total.us, .raw_fraction = a->raw_total.fraction_q19,
+        .corrected_us = a->corrected_total.us, .awake_us = a->awake_total_us,
+        .light_raw_us = s_clock.light_seen.raw_total.us,
+        .light_sdk_us = s_clock.light_seen.sdk_total_us,
+        .light_offset_us = s_clock.light_seen.wall_offset_total_us,
+        .ppm = a->active_qualified ? a->active_ppm : 0,
+        .continuity = a->continuity, .source = a->source
+    };
+}
+
 static void initialize_runtime(bool deep_wakeup, bool time_trusted)
 {
     s_clock.initialized = true;
@@ -423,8 +462,11 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
     const bool retained_valid = rtc_clock_retained.magic == RTC_CLOCK_RETENTION_MAGIC && accounting_valid();
     s_clock.continuity_valid = deep_wakeup && retained_valid;
     s_clock.history_retained_valid = s_clock.continuity_valid && history_retained_valid();
+    if (!s_clock.history_retained_valid) memset(&rtc_clock_retained.history, 0, sizeof rtc_clock_retained.history);
     int32_t ppm = 0;
-    const rtc_clock_store_result_t coefficient = rtc_clock_platform_load_coefficient(&ppm);
+    const bool rc_learning = rtc_mode_deep_sleep(s_clock.mode);
+    const rtc_clock_store_result_t coefficient = rc_learning ?
+        rtc_clock_platform_load_coefficient(&ppm) : RTC_CLOCK_STORE_MISSING;
     s_clock.coefficient_saved = coefficient == RTC_CLOCK_STORE_VALID && ppm >= -20000 && ppm <= 20000;
     s_clock.coefficient_blocked = coefficient == RTC_CLOCK_STORE_BLOCKED ||
         (coefficient == RTC_CLOCK_STORE_VALID && !s_clock.coefficient_saved);
@@ -435,6 +477,7 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
         rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
         a->version = RTC_CLOCK_VERSION;
         a->source = s_clock.source;
+        a->mode = (uint32_t)s_clock.mode;
         a->continuity = 1;
         a->active_ppm = s_clock.saved_ppm;
         a->active_qualified = s_clock.coefficient_saved;
@@ -466,7 +509,8 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
         rtc_clock_retained.maintenance_blocked = 0;
         rtc_clock_retained.magic = RTC_CLOCK_RETENTION_MAGIC;
     }
-    const rtc_clock_store_result_t loaded = rtc_clock_platform_load(&s_clock.saved_model);
+    const rtc_clock_store_result_t loaded = rc_learning ?
+        rtc_clock_platform_load(&s_clock.saved_model) : RTC_CLOCK_STORE_MISSING;
     s_clock.saved_valid = loaded == RTC_CLOCK_STORE_VALID && rtc_drift_model_validate(&s_clock.saved_model);
     s_clock.save_blocked = loaded == RTC_CLOCK_STORE_BLOCKED ||
                          (loaded == RTC_CLOCK_STORE_VALID && !s_clock.saved_valid);
@@ -479,6 +523,12 @@ static void initialize_runtime(bool deep_wakeup, bool time_trusted)
         }
     }
     if (!deep_wakeup) clear_session();
+    rtc_trace_init();
+    if (!deep_wakeup) {
+        rtc_trace_cancel();
+        const rtc_trace_record_t row = trace_snapshot(RTC_TRACE_RESET, s_clock.execution_hrt_us);
+        rtc_trace_append(&row);
+    }
 }
 
 /* 这是相位配对窗口，不是对 RTC 频率或长期精度的承诺。 */
@@ -550,7 +600,8 @@ rtc_clock_boot_result_t rtc_clock_boot(bool deep_wakeup, bool time_trusted)
         s_clock.boot_done = true;
         return s_clock.boot_result = deep_wakeup && time_trusted ? RTC_CLOCK_NEEDS_SYNC : RTC_CLOCK_BASELINE;
     }
-    if (!s_clock.supported || !s_clock.continuity_valid || !rtc_clock_session_valid(session) ||
+    if (!rtc_mode_deep_sleep(s_clock.mode) || !s_clock.supported ||
+        !s_clock.continuity_valid || !rtc_clock_session_valid(session) || session->mode != (uint32_t)s_clock.mode ||
         session->source != s_clock.source || session->continuity != rtc_clock_retained.accounting.continuity ||
         session->ledger.phase != RTC_DRIFT_LEDGER_ACTIVE || session->fault) {
         reset_learning();
@@ -624,6 +675,11 @@ rtc_clock_boot_result_t rtc_clock_boot(bool deep_wakeup, bool time_trusted)
     s_clock.sdk_correction_us = sdk_sample_valid ? sdk_correction : 0;
     s_clock.sdk_sample_valid = sdk_sample_valid;
     s_clock.boot_done = true;
+    rtc_trace_record_t trace = trace_snapshot(RTC_TRACE_SLEEP, hrt_anchor);
+    trace.end_tick = tick;
+    trace.wall_after_us = target - (hrt_now - hrt_anchor);
+    trace.ppm = session->ppm;
+    rtc_trace_end(&trace, session->ledger.anchor_tick, session->ledger.period_q19);
     return s_clock.boot_result = checked ? RTC_CLOCK_RESTORED : RTC_CLOCK_NEEDS_SYNC;
 }
 
@@ -651,6 +707,7 @@ static bool model_changed_enough(const rtc_drift_model_t *current)
 
 static void checkpoint_model(void)
 {
+    if (!rtc_mode_deep_sleep(s_clock.mode)) return;
     rtc_drift_model_t *model = &rtc_clock_retained.model;
     const uint64_t now = rtc_clock_platform_rtc_us();
     if (s_clock.save_blocked || !rtc_drift_model_validate(model) ||
@@ -673,6 +730,7 @@ static void read_temperature(int64_t now)
 
 static bool measure_period(void)
 {
+    if (!rtc_mode_deep_sleep(s_clock.mode)) return false;
     if (rtc_clock_platform_source() != s_clock.source) return false;
     const uint32_t period = rtc_clock_platform_measure();
     if (rtc_clock_platform_source() != s_clock.source || !rtc_drift_period_valid(period)) return false;
@@ -690,6 +748,7 @@ static bool measure_period(void)
 
 static void advance_budget(int64_t hrt)
 {
+    if (!rtc_mode_deep_sleep(s_clock.mode)) return;
     if (hrt < s_clock.budget_hrt_us || s_clock.budget_hrt_us < 0) return;
     rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
     const uint64_t delta = (uint64_t)(hrt - s_clock.budget_hrt_us);
@@ -701,7 +760,7 @@ static void advance_budget(int64_t hrt)
 
 bool rtc_clock_start_light_sleep(void)
 {
-    if (!s_clock.initialized || !s_clock.supported || s_clock.provisional || s_clock.light_fault)
+    if (!rtc_mode_light_sleep(s_clock.mode) || !s_clock.initialized || !s_clock.supported || s_clock.provisional || s_clock.light_fault)
         return false;
     if (s_clock.light_enabled) return true;
     if (!measure_period() || !rtc_light_sleep_platform_start(s_clock.direct.period_q19, s_clock.source))
@@ -794,6 +853,7 @@ bool rtc_clock_service_light_sleep(void)
 
 static void checkpoint_coefficient(void)
 {
+    if (!rtc_mode_deep_sleep(s_clock.mode)) return;
     rtc_clock_accounting_t *a = &rtc_clock_retained.accounting;
     advance_budget(rtc_clock_platform_uptime_us());
     const int32_t ppm = a->active_ppm;
@@ -812,7 +872,8 @@ static void checkpoint_coefficient(void)
 
 void rtc_clock_tick(void)
 {
-    if (!s_clock.initialized || !s_clock.supported || s_clock.maintenance || s_clock.provisional) return;
+    if (!rtc_mode_deep_sleep(s_clock.mode) || !s_clock.initialized ||
+        !s_clock.supported || s_clock.maintenance || s_clock.provisional) return;
     (void)rtc_clock_service_light_sleep();
     if (rtc_clock_platform_source() != s_clock.source) {
         reset_learning();
@@ -838,7 +899,7 @@ void rtc_clock_tick(void)
 
 bool rtc_clock_prepare_sleep(void)
 {
-    if (!s_clock.initialized || s_clock.provisional) return false;
+    if (!rtc_mode_deep_sleep(s_clock.mode) || !s_clock.initialized || s_clock.provisional) return false;
     (void)rtc_clock_service_light_sleep();
     if (rtc_clock_platform_source() != s_clock.source) {
         s_clock.prepared_period = 0;
@@ -864,12 +925,13 @@ bool rtc_clock_prepare_sleep(void)
 
 bool rtc_clock_commit_sleep(bool time_trusted)
 {
-    if (!s_clock.initialized || s_clock.provisional) return false;
+    if (!rtc_mode_deep_sleep(s_clock.mode) || !s_clock.initialized || s_clock.provisional) return false;
     (void)rtc_clock_service_light_sleep();
     time_trusted = time_trusted && !s_clock.light_needs_sync;
     s_clock.backup_session = rtc_clock_retained.session;
     s_clock.backup_maintenance_count = rtc_clock_retained.accounting.maintenance_count;
     if (!rtc_drift_period_valid(s_clock.prepared_period)) {
+        rtc_trace_cancel();
         clear_session();
         rtc_clock_platform_arm(false);
         s_clock.provisional = true;
@@ -890,6 +952,7 @@ bool rtc_clock_commit_sleep(bool time_trusted)
     s_clock.execution_hrt_us = hrt;
     advance_budget(hrt);
     next.source = s_clock.source;
+    next.mode = (uint32_t)s_clock.mode;
     next.ppm = a->active_qualified ? a->active_ppm : 0;
     next.anchor_phase_q19 = a->utc_phase_q19;
     next.continuity = a->continuity;
@@ -900,23 +963,29 @@ bool rtc_clock_commit_sleep(bool time_trusted)
     next.version = RTC_CLOCK_VERSION;
     const bool arm_maintenance = captured && s_clock.supported && !rtc_clock_retained.maintenance_blocked;
     next.maintenance_enabled = arm_maintenance ? rtc_clock_platform_arm_interval(
-        s_clock.maintenance ? RTC_CLOCK_STEADY_WAKE_US : RTC_CLOCK_COOLDOWN_WAKE_US) :
+        rtc_mode_interval_us(s_clock.mode, !s_clock.maintenance)) :
         rtc_clock_platform_arm(false);
     if (s_clock.maintenance && a->maintenance_count != UINT32_MAX) ++a->maintenance_count;
     rtc_clock_session_seal(&next);
     rtc_clock_retained.session = next;
     s_clock.provisional = true;
     seal_accounting();
+    rtc_trace_record_t trace = trace_snapshot(RTC_TRACE_SLEEP, hrt);
+    trace.commit_hrt_us = hrt;
+    trace.start_tick = tick;
+    trace.wall_before_us = captured ? utc : -1;
+    trace.period_q19 = s_clock.prepared_period;
+    rtc_trace_begin(&trace);
     return true;
 }
 
 bool rtc_clock_maintenance_due(bool timer_only)
 {
     const rtc_clock_session_t *session = &rtc_clock_retained.session;
-    return timer_only && s_clock.initialized && s_clock.supported && !s_clock.provisional &&
+    return rtc_mode_deep_sleep(s_clock.mode) && timer_only && s_clock.initialized && s_clock.supported && !s_clock.provisional &&
         s_clock.boot_done && s_clock.boot_result == RTC_CLOCK_RESTORED &&
         rtc_clock_session_valid(session) && accounting_valid() &&
-        session->source == rtc_clock_platform_source() &&
+        session->source == rtc_clock_platform_source() && session->mode == (uint32_t)s_clock.mode &&
         session->continuity == rtc_clock_retained.accounting.continuity &&
         session->utc_trusted && !session->fault && session->maintenance_enabled &&
         !rtc_clock_retained.maintenance_blocked;
@@ -967,6 +1036,7 @@ void rtc_clock_begin_normal_wake(void)
 bool rtc_clock_abort_sleep(void)
 {
     if (!s_clock.initialized) return false;
+    rtc_trace_cancel();
     rtc_clock_platform_arm(false);
     if (s_clock.provisional) {
         rtc_clock_retained.session = s_clock.backup_session;
@@ -1118,7 +1188,8 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
     bool capture_history = false;
     bool evidence_dropped = false;
     uint64_t reference_awake = 0;
-    const bool eligible = s_clock.boot_done && reference->quality && age <= UINT64_C(5000000) && s_clock.supported &&
+    const bool eligible = rtc_mode_deep_sleep(s_clock.mode) && s_clock.boot_done &&
+        reference->quality && age <= UINT64_C(5000000) && s_clock.supported &&
         awake_at(reference->hrt_us, &reference_awake) && rtc_clock_platform_source() == s_clock.source;
     if (eligible) {
         const rtc_drift_reference_t sample = {
@@ -1142,6 +1213,9 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
             }
         }
     }
+    const int64_t trace_before = rtc_clock_platform_uptime_us();
+    int64_t previous_wall = -1;
+    const bool trace_wall_valid = rtc_clock_platform_get_wall_us(&previous_wall);
     const int64_t before = rtc_clock_platform_uptime_us();
     if (before < now || (uint64_t)(before - reference->hrt_us) > maximum - reference->utc_us ||
         (reference->max_age_us && (uint64_t)(before - reference->hrt_us) > reference->max_age_us))
@@ -1196,5 +1270,17 @@ rtc_clock_reference_result_t rtc_clock_apply_reference(const rtc_clock_reference
     s_clock.reconciled_elapsed_us = s_clock.corrected_elapsed_us = 0;
     s_clock.sdk_sample_valid = false;
     s_clock.sdk_correction_us = 0;
+    rtc_trace_record_t trace = trace_snapshot(checked ? RTC_TRACE_REFERENCE : RTC_TRACE_UNCERTAIN_REFERENCE, before);
+    trace.wall_before_us = -1;
+    if (trace_wall_valid && previous_wall >= 0 && before >= trace_before &&
+        before - trace_before <= CLOCK_CAPTURE_MAX_US) {
+        const int64_t adjust = (before - trace_before + 1) / 2;
+        if (previous_wall <= INT64_MAX - adjust) trace.wall_before_us = previous_wall + adjust;
+    }
+    trace.wall_after_us = target;
+    uint64_t trace_awake;
+    if (awake_at(before, &trace_awake)) trace.awake_us = trace_awake;
+    rtc_trace_cancel();
+    rtc_trace_append(&trace);
     return checked ? RTC_CLOCK_REFERENCE_SET : RTC_CLOCK_REFERENCE_UNCERTAIN;
 }

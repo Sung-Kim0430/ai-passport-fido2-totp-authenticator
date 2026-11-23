@@ -452,3 +452,45 @@ and version-2 references expire in both the HTTP and owner stages. Transport
 uncertainty and the assumed one-second phone UTC bound remain separate metadata,
 combined conservatively for the existing learning interface. This change neither
 activates shadow coefficients nor proves millisecond absolute UTC accuracy.
+
+
+## RTC regression diagnostic — 2026-11-21
+
+Severe RTC drift remains unresolved, and current firmware accuracy is unverified. While the user confirmed earlier ~-870 ppm compensation worked during identical USB-disconnected overnight runs, recent evidence shows a raw shortfall of 433.088618 seconds over 9 hours; applying -870 ppm only reduces this to 405.263586 seconds. Short external reference tests (120 s and 900 s) are planned without modifying timekeeping policies or claiming accuracy.
+
+A dedicated 6152-byte RTC memory trace (capacity 44 records at 136 bytes each) performs no flash writes and does not control timekeeping. It logs start/wake/restore ticks, commit/restore HRT endpoints, oscillator tick period and applied ppm, raw/corrected/awake totals, boot-local light-sleep SDK raw/offsets, and pre/post-sync system time. Abandoned sleeps are recorded as GAP, pending states are exposed, sequence numbers detect missing or overwritten entries, and CRCs identify damaged records. No credentials are saved.
+
+Disconnecting USB while battery-powered is not power loss, though retention is best-effort, unverified on-device, and USB resets may lose records. A phone sync first ends the interval and logs pre-sync error, followed by a manual ROM loader read of 6152 bytes matching ELF symbol rtc_trace_store. Reset invalidates UTC, requiring user resynchronization. Dumps decode offline via `python3 tools/decode_rtc_trace.py <dump.bin>`.
+
+## Device trace findings — 2026-11-23
+
+Installed diagnostic firmware passed prior build and host validation gates before flashing, verified against its archived 512-byte descriptor before trace decoding. Today’s work represents ROM readback and offline analysis, not a new firmware build or accuracy acceptance; no new firmware changes or flashing occurred. The user confirmed an approximate 48h49m battery test, mostly unplugged under automatic screen-off.
+
+Durable calibration history now holds 6 valid records (accepted 6, dropped 0). Across the latest 175745.583018 s (~48.8182 h) reference window, phone sync moved the clock backward 26.742436 s (clock fast). Current -15640 ppm configuration in NVS is demonstrably applied: all 43 retained sleep restorations apply `raw/(1+ppm/1e6)`, where raw represents ticks already converted to time using the measured period rather than a direct scaling of bare ticks, and window replay predicts 26.751068 s fast.
+
+All 44 surviving trace records (seq 156–199; 155 overwritten) have valid CRCs without missing entries, comprising 43 sleep records and an ending reference with no post-sync sleep. 42 adjacent pairs reconcile raw time totals (including Q19 fractional remainder, rather than asserting equality of oscillator periods) and awake spans (47.107–47.113 ms) exactly; wake-to-app latencies (138.972–139.603 ms) are included in recorded sleep. A manual UTC-boundary check reveals only ~1.645 ms tail discrepancy. Raw sleep plus awake time falls 2720.147511 s short of reference, making the effective -15490.046928 ppm rate a compensation requirement, not proof the internal RC oscillator inherently needs it. Prior ~-870 ppm accuracy under identical overnight conditions serves as our regression comparison baseline, not an instruction to roll back.
+
+Root cause remains unproven; timing is not declared fixed or guaranteed. ROM extraction resets the device, requiring fresh phone sync. Next tests use identical firmware across 5-minute and 12-minute phone-bracketed battery intervals after screen-off (syncing before extraction) as an initial discriminator. Under a 120 s initial / 900 s maintenance cadence, this varies duration while keeping wake counts comparable; at the same confirmed wake count, the observed 1.55% bias predicts about 6.5 seconds difference in uncorrected deficits. Analysis must compare uncorrected deficits (Δreference − Δawake − Δraw) rather than merely small corrected sync errors. Traces must verify actual wake counts, ppm, and time spent in light sleep. A coefficient change does not invalidate the raw deficit, though any change must be recorded to interpret corrected wall error; extra wakes or substantial unmatched light-sleep exposure undermine the fixed-count deep-sleep comparison. Because phone endpoint uncertainty can make results inconclusive, a single pair cannot promise a conclusive diagnosis and additional runs may be needed. Avoid overnight runs until completed.
+
+
+### Short trace comparison — 2026-11-24
+
+Both matched two-wake short tests completed with no new flash. Test 1: reference 449.329191 s, raw deficit 4.479174 s. Test 2: reference 854.071108 s, raw deficit 9.138064 s. Applying −15640 ppm gave observed errors of 1.929124 s fast and 3.588898 s fast. Arithmetic replay residual was under 3 ms. Phone reference uncertainty of at least 1 s and unequal light-sleep exposure leave the root cause unproven. The trend supports a time-dependent bias but does not justify a new coefficient.
+
+### Selectable clock modes — 2026-11-24
+
+Configured via **Settings > Clock Mode** (independent entry). Confirming a mode change saves and then restarts; if saving fails, the device stays in the current mode. Restart discards unsaved calibration evidence (durable records remain) and requires a fresh phone sync.
+
+- **Eco**: Initial 120s, then 900s maintenance; preserves existing calibration and history.
+- **Frequent**: Initial 120s, then 180s; independent initially uncalibrated profile; multiple valid phone-sync sleep windows required.
+- **Quartz**: CPU DFS 40–160MHz; no light/deep sleep; display and radios off at standby; PIN lock and consume wake gesture; RC calibration disabled (RC history not applicable), but manual sync works.
+
+#### Standby examples at 450 mAh usable capacity
+
+| Mode | Assumed current (unmeasured) | Estimated duration | Accuracy |
+| :--- | :--- | :--- | :--- |
+| Eco | 0.2–0.5mA | 37–94 days | One observed 48.82h run: fast 26.74s |
+| Frequent | 0.3–0.6mA | 31–63 days | Unmeasured |
+| Quartz | 10–25mA | 18–45 hours | Example 10ppm (0.864s/day), NOT verified rating |
+
+Drift root cause unresolved; no yearly guarantee. Build and host tests passed; firmware archive verified. Device tests NOT RUN. Board current, overnight precision, and on-device screen/key behavior remain unverified. No flash or commit performed.

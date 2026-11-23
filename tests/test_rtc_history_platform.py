@@ -26,7 +26,8 @@ class HistoryPlatform(unittest.TestCase):
             ('history_nvs_commit', 'static bool history_nvs_commit(void *u)'),
             ('rtc_history_store_platform_io', 'rtc_history_store_result_t rtc_history_store_platform_io(rtc_history_store_io_t *io)')]
         code = r'''
-#include "rtc_history_store.h"
+#include "rtc_clock.h"
+rtc_mode_t rtc_clock_get_mode(void) { return RTC_MODE_ECO; }
 #include <assert.h>
 #include <string.h>
 typedef int nvs_handle_t;
